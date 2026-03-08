@@ -287,8 +287,8 @@ app.get('/', (req, res) => {
         <h1><span>Éphémère</span> <span class="storage-info">${(currentTotalSize / (1024 ** 3)).toFixed(2)} / 15 Go</span></h1>
 
         <div class="settings">
-            <div>⏳ Autodestruction : <input type="number" id="duration" min="1" max="15" value="5"> min</div>
-            <button class="btn-refresh" onclick="window.location.reload()">🔄 Rafraîchir</button>
+            <div>Autodestruction : <input type="number" id="duration" min="1" max="15" value="5"> min</div>
+            <button class="btn-refresh" onclick="window.location.reload()">Rafraîchir</button>
         </div>
 
         <div id="progress-wrapper">

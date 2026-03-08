@@ -244,7 +244,7 @@ app.get('/', (req, res) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>CopyPaste</title>
+        <title>CopyPaste (non chiffré)</title>
         <style>
             :root { --bg: #ffffff; --text: #000000; --gray: #888888; --light-gray: #f5f5f5; --border: #eeeeee; --red: #d93025; }
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 600px; margin: 2rem auto; padding: 0 1rem; color: var(--text); background: var(--bg); line-height: 1.5; }

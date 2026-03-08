@@ -9,92 +9,135 @@ const app = express();
 const PORT = 3000;
 const UPLOAD_DIR = path.join(__dirname, 'temp_uploads');
 
-// SÉCURITÉ: Nettoyage robuste au démarrage avec gestion des erreurs
+// Nettoyage asynchrone au démarrage
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
-try {
-    fs.readdirSync(UPLOAD_DIR).forEach(f => fs.unlinkSync(path.join(UPLOAD_DIR, f)));
-} catch (err) { console.error("Info: Certains fichiers temporaires n'ont pas pu être nettoyés au démarrage."); }
+try { fs.readdirSync(UPLOAD_DIR).forEach(f => fs.unlinkSync(path.join(UPLOAD_DIR, f))); } catch (err) {}
 
-const MAX_STORAGE_BYTES = 32 * 1024 * 1024 * 1024; // 32 Go
-const MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024; // 5 Go
-const ABSOLUTE_TIMEOUT_MS = 60 * 60 * 1000; // 1 heure max
+// === LIMITES STRICTES PROXMOX (512Mo RAM, 1 Core) ===
+const MAX_STORAGE_BYTES = 15 * 1024 * 1024 * 1024; // 15 Go
+const MAX_GLOBAL_FILES = 5000; 
+const MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024; // 2 Go
+const MAX_TEXT_SIZE = 2 * 1024 * 1024; // 2 Mo
+const ABSOLUTE_TIMEOUT_MS = 60 * 60 * 1000; 
+const MAX_SSE_CLIENTS = 100; 
 
 let currentTotalSize = 0;
+let currentTotalFiles = 0;
 let reservedSize = 0;
 const storedItems = new Map();
 const connectedClients = new Set();
 
+// SÉCURITÉ : Traceur de fichiers temporaires pour nettoyage chirurgical
 const storage = multer.diskStorage({
     destination: UPLOAD_DIR,
     filename: (req, file, cb) => {
         const uniqueId = crypto.randomBytes(8).toString('hex');
         const safeName = path.basename(file.originalname);
-        cb(null, `${uniqueId}-${safeName}`);
+        const fullFilename = `${uniqueId}-${safeName}`;
+        
+        // On trace le fichier dès que Multer commence à l'écrire
+        if (!req.multerTempFiles) req.multerTempFiles = [];
+        req.multerTempFiles.push(path.join(UPLOAD_DIR, fullFilename));
+        
+        cb(null, fullFilename);
     }
 });
 
+// SÉCURITÉ : Limites poussées à l'extrême
 const upload = multer({ 
     storage: storage,
     limits: { 
-        fileSize: MAX_FILE_SIZE,
-        fieldSize: 5 * 1024 * 1024, // SÉCURITÉ: Limite à 5 Mo pour le texte (évite la saturation RAM)
-        files: 2000
+        fileSize: MAX_FILE_SIZE, 
+        fieldSize: MAX_TEXT_SIZE, 
+        files: 500,
+        fields: 10 // Anti-RAM DoS : Maximum 10 champs texte autorisés par requête
     }
 });
 
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+app.use(express.urlencoded({ extended: true, limit: '100kb' }));
+app.use(express.json({ limit: '100kb' }));
 
 function escapeHtml(unsafe) {
     return (unsafe || '').toString()
-         .replace(/&/g, "&amp;")
-         .replace(/</g, "&lt;")
-         .replace(/>/g, "&gt;")
-         .replace(/"/g, "&quot;")
-         .replace(/'/g, "&#039;");
+         .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+         .replace(/"/g, "&quot;").replace(/'/g, "&#039;");
 }
 
+function safeUnlink(filePath, retries = 3) {
+    if (!filePath) return;
+    fs.unlink(filePath, (err) => {
+        if (err && err.code === 'EBUSY' && retries > 0) {
+            setTimeout(() => safeUnlink(filePath, retries - 1), 10000);
+        }
+    });
+}
+
+// SÉCURITÉ : Blocage "Chunked", Réservation d'espace ET Anti-Mensonge "Content-Length"
 app.use((req, res, next) => {
     if (req.method === 'POST' && req.path.startsWith('/upload')) {
-        const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+        const contentLengthHeader = req.headers['content-length'];
+        if (!contentLengthHeader) return res.status(411).send("Code 411 : 'Content-Length' requis.");
+
+        const contentLength = Math.max(0, parseInt(contentLengthHeader, 10) || 0);
         
         if (currentTotalSize + reservedSize + contentLength > MAX_STORAGE_BYTES) {
-            return res.status(413).send("La limite globale du serveur (32 Go) est atteinte.");
+            return res.status(413).send("La limite de 15 Go est atteinte ou l'espace est temporairement réservé.");
+        }
+        if (currentTotalFiles >= MAX_GLOBAL_FILES) {
+            return res.status(503).send("Quota maximum de fichiers simultanés atteint.");
         }
         
         req.reservedBytes = contentLength;
         reservedSize += contentLength;
 
-        res.on('finish', () => reservedSize -= req.reservedBytes);
-        res.on('close', () => { if (!res.writableEnded) reservedSize -= req.reservedBytes; });
+        // Foudroie la connexion si le flux de données dépasse ce qui a été promis (Anti-Mensonge)
+        let actualBytesReceived = 0;
+        req.on('data', (chunk) => {
+            actualBytesReceived += chunk.length;
+            if (actualBytesReceived > contentLength + 2048) { // 2Ko de marge pour les headers multipart
+                req.destroy(); // Destruction brutale du socket au niveau TCP
+            }
+        });
+
+        req.reservationReleased = false;
+        const cleanupRequest = () => {
+            if (!req.reservationReleased) {
+                reservedSize = Math.max(0, reservedSize - req.reservedBytes);
+                req.reservationReleased = true;
+            }
+            // SÉCURITÉ : Nettoyage immédiat si la requête coupe brutalement avant la fin
+            if (!res.writableEnded && req.multerTempFiles) {
+                req.multerTempFiles.forEach(f => safeUnlink(f));
+                req.multerTempFiles = [];
+            }
+        };
+
+        res.on('finish', cleanupRequest);
+        res.on('close', cleanupRequest);
     }
     next();
 });
 
+// --- GESTION DU TEMPS RÉEL (SSE) ---
 app.get('/events', (req, res) => {
+    if (connectedClients.size >= MAX_SSE_CLIENTS) return res.status(503).end();
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
 
     connectedClients.add(res);
-    req.on('close', () => connectedClients.delete(res));
+    const heartbeat = setInterval(() => res.write(':\n\n'), 20000);
+
+    req.on('close', () => {
+        clearInterval(heartbeat);
+        connectedClients.delete(res);
+    });
 });
 
 function broadcastDelete(id) {
     const message = `data: ${JSON.stringify({ type: 'delete', id: id })}\n\n`;
-    for (const client of connectedClients) {
-        client.write(message);
-    }
-}
-
-// SÉCURITÉ: Suppression avec Retry en cas de fichier verrouillé par l'OS (ex: Windows EBUSY)
-function safeUnlink(filePath, retries = 3) {
-    fs.unlink(filePath, (err) => {
-        if (err && err.code === 'EBUSY' && retries > 0) {
-            setTimeout(() => safeUnlink(filePath, retries - 1), 10000); // Réessaie dans 10 sec
-        }
-    });
+    for (const client of connectedClients) client.write(message);
 }
 
 function scheduleDestruction(id, delayMs) {
@@ -134,7 +177,6 @@ function deleteItemData(id) {
         clearTimeout(item.timeoutId);
         clearTimeout(item.absoluteTimeoutId);
         storedItems.delete(id);
-        currentTotalSize -= item.size;
         safeUnlink(item.path);
         broadcastDelete(id);
     }
@@ -142,34 +184,43 @@ function deleteItemData(id) {
 
 function getPreviewHtml(item) {
     if (item.isText) {
-        let content = '';
-        try { 
-            // SÉCURITÉ: On ne lit que les 50 premiers Ko en mémoire pour éviter le crash serveur
-            const fd = fs.openSync(item.path, 'r');
-            const buffer = Buffer.alloc(50000); 
-            const bytesRead = fs.readSync(fd, buffer, 0, 50000, 0);
-            fs.closeSync(fd);
-            
-            content = buffer.toString('utf8', 0, bytesRead);
-            if (item.size > 50000) content += '\n\n[... Aperçu tronqué (trop lourd), copiez ou téléchargez pour la suite ...]';
-        } catch (e) { content = 'Erreur de lecture de l\'aperçu'; }
-        
         return `
-            <div class="preview-box text-content">${escapeHtml(content)}</div>
+            <div class="preview-box text-content">${item.previewText}</div>
             <button class="btn-copy" onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copié !'; setTimeout(()=>this.innerText='Copier', 2000)">Copier</button>
         `;
     }
-
     const ext = path.extname(item.originalName).toLowerCase();
     if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) return `<img class="preview-media" src="/view/${item.id}" loading="lazy" alt="Aperçu">`;
     if (['.mp4', '.webm'].includes(ext)) return `<video class="preview-media" controls src="/view/${item.id}" preload="none"></video>`;
     if (['.mp3', '.wav', '.ogg'].includes(ext)) return `<audio class="preview-audio" controls src="/view/${item.id}" preload="none"></audio>`;
     if (ext === '.pdf') return `<iframe class="preview-pdf" src="/view/${item.id}"></iframe>`;
-    
     return `<div class="preview-box">Aperçu indisponible</div>`;
 }
 
-// --- ROUTES ---
+// SÉCURITÉ : Auto-Healer Asynchrone (Non-Bloquant pour le CPU)
+setInterval(async () => {
+    try {
+        let actualPhysicalSize = 0;
+        let actualFileCount = 0;
+        const activePaths = new Set(Array.from(storedItems.values()).map(i => path.basename(i.path)));
+        
+        const filesOnDisk = await fs.promises.readdir(UPLOAD_DIR);
+
+        for (const file of filesOnDisk) {
+            const filePath = path.join(UPLOAD_DIR, file);
+            const stats = await fs.promises.stat(filePath);
+
+            if (!activePaths.has(file) && (Date.now() - stats.mtimeMs > ABSOLUTE_TIMEOUT_MS)) {
+                safeUnlink(filePath);
+            } else {
+                actualPhysicalSize += stats.size;
+                actualFileCount++;
+            }
+        }
+        currentTotalSize = actualPhysicalSize;
+        currentTotalFiles = actualFileCount;
+    } catch (err) {}
+}, 15 * 60 * 1000);
 
 app.get('/', (req, res) => {
     const itemsHtml = Array.from(storedItems.values()).sort((a, b) => a.expiresAt - b.expiresAt).map(item => `
@@ -233,7 +284,7 @@ app.get('/', (req, res) => {
         </style>
     </head>
     <body>
-        <h1><span>Éphémère</span> <span class="storage-info">${(currentTotalSize / (1024 ** 3)).toFixed(2)} / 32 Go</span></h1>
+        <h1><span>Éphémère</span> <span class="storage-info">${(currentTotalSize / (1024 ** 3)).toFixed(2)} / 15 Go</span></h1>
 
         <div class="settings">
             <div>⏳ Autodestruction : <input type="number" id="duration" min="1" max="15" value="5"> min</div>
@@ -401,28 +452,20 @@ function getDelayMs(req) {
     return durationMin * 60 * 1000;
 }
 
-function verifyStorageLimitPostUpload(reqFiles) {
-    let incomingSize = 0;
-    reqFiles.forEach(f => incomingSize += f.size);
-    if (currentTotalSize + incomingSize > MAX_STORAGE_BYTES) {
-        reqFiles.forEach(f => safeUnlink(f.path));
-        return false;
-    }
-    return true;
-}
-
+// SÉCURITÉ : Nettoyage multi-plateforme (Linux/Windows) de l'arborescence
 function sanitizeRelativePath(unsafePath) {
-    let clean = unsafePath.replace(/\0/g, '');
+    // Supprime les null bytes et convertit les antislash (Windows) en slash (Linux)
+    let clean = unsafePath.replace(/\0/g, '').replace(/\\/g, '/');
     clean = path.normalize(clean);
-    if (clean.startsWith('..') || clean.startsWith('/') || clean.startsWith('\\')) {
+    if (clean.startsWith('..') || clean.startsWith('/')) {
         return path.basename(clean); 
     }
     return clean;
 }
 
 app.post('/upload-files', upload.array('files'), (req, res) => {
+    // Le nettoyage en cas d'erreur de taille ou de connexion est déjà géré par l'intercepteur global et close event
     if (!req.files || req.files.length === 0) return res.status(400).send('Aucun fichier.');
-    if (!verifyStorageLimitPostUpload(req.files)) return res.status(413).send('Limite des 32 Go dépassée.');
     
     const delayMs = getDelayMs(req);
     const tokens = [];
@@ -430,7 +473,10 @@ app.post('/upload-files', upload.array('files'), (req, res) => {
     req.files.forEach(file => {
         const id = file.filename;
         const fileSize = file.size;
+        
         currentTotalSize += fileSize;
+        currentTotalFiles++;
+        
         const deleteToken = crypto.randomBytes(16).toString('hex');
         
         storedItems.set(id, {
@@ -440,23 +486,26 @@ app.post('/upload-files', upload.array('files'), (req, res) => {
         scheduleDestruction(id, delayMs);
         tokens.push({ id, token: deleteToken });
     });
+    
+    // Purge l'array des fichiers temporaires pour éviter qu'ils soient supprimés par res.on('finish')
+    req.multerTempFiles = [];
     res.json({ tokens });
 });
 
 app.post('/upload-folder', upload.array('files'), (req, res) => {
     if (!req.files || req.files.length === 0) return res.status(400).send('Dossier vide.');
-    if (!verifyStorageLimitPostUpload(req.files)) return res.status(413).send('Limite des 32 Go dépassée.');
     
     const delayMs = getDelayMs(req);
     const id = crypto.randomBytes(8).toString('hex') + '-archive.zip';
     const zipPath = path.join(UPLOAD_DIR, id);
     
     const output = fs.createWriteStream(zipPath);
-    const archive = archiver('zip', { zlib: { level: 5 } });
+    const archive = archiver('zip', { zlib: { level: 0 } });
 
     output.on('close', () => {
         const fileSize = archive.pointer();
         currentTotalSize += fileSize;
+        currentTotalFiles++;
         const deleteToken = crypto.randomBytes(16).toString('hex');
         
         storedItems.set(id, {
@@ -466,13 +515,13 @@ app.post('/upload-folder', upload.array('files'), (req, res) => {
         scheduleDestruction(id, delayMs);
         
         req.files.forEach(f => safeUnlink(f.path));
+        req.multerTempFiles = []; // Déclare le succès
         res.json({ tokens: [{ id, token: deleteToken }] });
     });
 
     archive.on('error', (err) => {
-        req.files.forEach(f => safeUnlink(f.path));
         safeUnlink(zipPath);
-        res.status(500).send(err.message);
+        if (!res.headersSent) res.status(500).send(err.message);
     });
 
     archive.pipe(output);
@@ -484,7 +533,6 @@ app.post('/upload-folder', upload.array('files'), (req, res) => {
 });
 
 app.post('/upload-text', upload.none(), (req, res) => {
-    // SÉCURITÉ: Vérifie strictement l'existence et le type du texte avant de manipuler
     if (!req.body || typeof req.body.text !== 'string' || req.body.text.trim() === '') {
         return res.status(400).send('Texte vide ou invalide.');
     }
@@ -495,16 +543,24 @@ app.post('/upload-text', upload.none(), (req, res) => {
     const buffer = Buffer.from(textContent, 'utf-8');
     const fileSize = buffer.length;
 
-    if (currentTotalSize + fileSize > MAX_STORAGE_BYTES) return res.status(413).send('Limite des 32 Go dépassée.');
+    if (currentTotalSize + fileSize > MAX_STORAGE_BYTES) return res.status(413).send('Limite des 15 Go dépassée.');
+    if (currentTotalFiles >= MAX_GLOBAL_FILES) return res.status(503).send("Trop de fichiers.");
 
     fs.writeFile(filePath, buffer, (err) => {
         if (err) return res.status(500).send("Erreur de sauvegarde.");
         currentTotalSize += fileSize;
+        currentTotalFiles++;
         const deleteToken = crypto.randomBytes(16).toString('hex');
+
+        const previewLimit = 2000;
+        const isTruncated = buffer.length > previewLimit;
+        const previewRaw = buffer.toString('utf8', 0, Math.min(buffer.length, previewLimit));
+        const safePreview = escapeHtml(previewRaw) + (isTruncated ? '\n\n<em style="color:#888;">[... Aperçu tronqué, copiez ou téléchargez pour lire la suite ...]</em>' : '');
 
         storedItems.set(id, {
             id, originalName: 'Texte collé', path: filePath, size: fileSize,
-            isText: true, activeDownloads: 0, deleteToken
+            isText: true, activeDownloads: 0, deleteToken,
+            previewText: safePreview
         });
         scheduleDestruction(id, delayMs);
         res.json({ tokens: [{ id, token: deleteToken }] });
@@ -513,7 +569,18 @@ app.post('/upload-text', upload.none(), (req, res) => {
 
 app.post('/delete/:id', (req, res) => {
     const item = storedItems.get(req.params.id);
-    if (item && item.deleteToken === req.body.token) {
+    if (!item) return res.status(404).send('Inconnu');
+
+    // SÉCURITÉ : Vérification de format avant de Bufferiser (évite les erreurs fatales)
+    let clientTokenStr = req.body.token || '';
+    if (typeof clientTokenStr !== 'string' || !/^[0-9a-f]{32}$/.test(clientTokenStr)) {
+        return res.status(403).send('Jeton invalide.');
+    }
+
+    const tokenA = Buffer.from(item.deleteToken, 'hex');
+    const tokenB = Buffer.from(clientTokenStr, 'hex');
+
+    if (tokenA.length === tokenB.length && crypto.timingSafeEqual(tokenA, tokenB)) {
         deleteItemData(req.params.id);
         res.sendStatus(200);
     } else {
@@ -527,7 +594,10 @@ app.get('/view/:id', (req, res) => {
 
     res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'");
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.sendFile(item.path);
+    // SÉCURITÉ : Évite le plantage du serveur Express si le fichier est lu au moment même où il est supprimé
+    res.sendFile(item.path, (err) => {
+        if (err && !res.headersSent) res.status(500).end();
+    });
 });
 
 app.get('/download/:id', (req, res) => {
@@ -535,24 +605,30 @@ app.get('/download/:id', (req, res) => {
     if (!item) return res.status(404).send('Expiré.');
 
     pauseTimer(item.id);
-
     res.download(item.path, item.originalName, (err) => {
         resumeTimer(item.id);
+        if (err && !res.headersSent) res.status(500).end();
     });
 });
 
-// SÉCURITÉ : Intercepteur global d'erreurs (Capture gracieusement les erreurs Multer)
+// Intercepteur Global Multicouche
 app.use((err, req, res, next) => {
+    // Si une erreur arrive, on nettoie les traces de Multer laissées en plan
+    if (req.multerTempFiles) {
+        req.multerTempFiles.forEach(f => safeUnlink(f));
+        req.multerTempFiles = [];
+    }
+
     if (err instanceof multer.MulterError) {
-        if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).send("Un fichier dépasse la limite autorisée (5 Go max).");
-        if (err.code === 'LIMIT_FIELD_SIZE') return res.status(413).send("Le texte est trop long (5 Mo max).");
+        if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).send("Un fichier dépasse la limite autorisée (2 Go max).");
+        if (err.code === 'LIMIT_FIELD_SIZE') return res.status(413).send("Le texte est trop long (2 Mo max).");
         return res.status(400).send(`Erreur d'upload : ${err.message}`);
     } else if (err) {
-        return res.status(500).send("Une erreur inattendue est survenue côté serveur.");
+        return res.status(500).send("Erreur serveur : Le transfert a été interrompu.");
     }
     next();
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Serveur minimaliste et ultra-sécurisé démarré sur http://localhost:${PORT}`);
+    console.log(`Serveur minimaliste et blindé démarré sur http://localhost:${PORT}`);
 });

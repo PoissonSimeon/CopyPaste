@@ -35,7 +35,6 @@ const storage = multer.diskStorage({
         const safeName = path.basename(file.originalname);
         const fullFilename = `${uniqueId}-${safeName}`;
         
-        // On trace le fichier dès que Multer commence à l'écrire
         if (!req.multerTempFiles) req.multerTempFiles = [];
         req.multerTempFiles.push(path.join(UPLOAD_DIR, fullFilename));
         
@@ -43,14 +42,13 @@ const storage = multer.diskStorage({
     }
 });
 
-// SÉCURITÉ : Limites poussées à l'extrême
 const upload = multer({ 
     storage: storage,
     limits: { 
         fileSize: MAX_FILE_SIZE, 
         fieldSize: MAX_TEXT_SIZE, 
         files: 500,
-        fields: 10 // Anti-RAM DoS : Maximum 10 champs texte autorisés par requête
+        fields: 10 
     }
 });
 
@@ -72,7 +70,6 @@ function safeUnlink(filePath, retries = 3) {
     });
 }
 
-// SÉCURITÉ : Blocage "Chunked", Réservation d'espace ET Anti-Mensonge "Content-Length"
 app.use((req, res, next) => {
     if (req.method === 'POST' && req.path.startsWith('/upload')) {
         const contentLengthHeader = req.headers['content-length'];
@@ -90,12 +87,11 @@ app.use((req, res, next) => {
         req.reservedBytes = contentLength;
         reservedSize += contentLength;
 
-        // Foudroie la connexion si le flux de données dépasse ce qui a été promis (Anti-Mensonge)
         let actualBytesReceived = 0;
         req.on('data', (chunk) => {
             actualBytesReceived += chunk.length;
-            if (actualBytesReceived > contentLength + 2048) { // 2Ko de marge pour les headers multipart
-                req.destroy(); // Destruction brutale du socket au niveau TCP
+            if (actualBytesReceived > contentLength + 2048) { 
+                req.destroy(); 
             }
         });
 
@@ -105,7 +101,6 @@ app.use((req, res, next) => {
                 reservedSize = Math.max(0, reservedSize - req.reservedBytes);
                 req.reservationReleased = true;
             }
-            // SÉCURITÉ : Nettoyage immédiat si la requête coupe brutalement avant la fin
             if (!res.writableEnded && req.multerTempFiles) {
                 req.multerTempFiles.forEach(f => safeUnlink(f));
                 req.multerTempFiles = [];
@@ -118,7 +113,6 @@ app.use((req, res, next) => {
     next();
 });
 
-// --- GESTION DU TEMPS RÉEL (SSE) ---
 app.get('/events', (req, res) => {
     if (connectedClients.size >= MAX_SSE_CLIENTS) return res.status(503).end();
     res.setHeader('Content-Type', 'text/event-stream');
@@ -197,7 +191,6 @@ function getPreviewHtml(item) {
     return `<div class="preview-box">Aperçu indisponible</div>`;
 }
 
-// SÉCURITÉ : Auto-Healer Asynchrone (Non-Bloquant pour le CPU)
 setInterval(async () => {
     try {
         let actualPhysicalSize = 0;
@@ -284,11 +277,11 @@ app.get('/', (req, res) => {
         </style>
     </head>
     <body>
-        <h1><span>Éphémère</span> <span class="storage-info">${(currentTotalSize / (1024 ** 3)).toFixed(2)} / 15 Go</span></h1>
+        <h1><span>CopyPaste</span> <span class="storage-info">${(currentTotalSize / (1024 ** 3)).toFixed(2)} / 15 Go</span></h1>
 
         <div class="settings">
-            <div>Autodestruction : <input type="number" id="duration" min="1" max="15" value="5"> min</div>
-            <button class="btn-refresh" onclick="window.location.reload()">Rafraîchir</button>
+            <div>⏳ Autodestruction : <input type="number" id="duration" min="1" max="15" value="5"> min</div>
+            <button class="btn-refresh" onclick="window.location.reload()">🔄 Rafraîchir</button>
         </div>
 
         <div id="progress-wrapper">
@@ -347,7 +340,7 @@ app.get('/', (req, res) => {
                 }
             };
 
-            const tokens = JSON.parse(localStorage.getItem('ephemere_tokens') || '{}');
+            const tokens = JSON.parse(localStorage.getItem('copypaste_tokens') || '{}');
             document.querySelectorAll('.item').forEach(el => {
                 const id = el.dataset.id;
                 if (tokens[id]) {
@@ -361,7 +354,7 @@ app.get('/', (req, res) => {
                             body: JSON.stringify({ token: tokens[id] })
                         }).then(() => {
                             delete tokens[id];
-                            localStorage.setItem('ephemere_tokens', JSON.stringify(tokens));
+                            localStorage.setItem('copypaste_tokens', JSON.stringify(tokens));
                         });
                     };
                     el.querySelector('.item-actions').appendChild(btn);
@@ -410,9 +403,9 @@ app.get('/', (req, res) => {
                         if (xhr.status === 200) {
                             try {
                                 const res = JSON.parse(xhr.responseText);
-                                const currentTokens = JSON.parse(localStorage.getItem('ephemere_tokens') || '{}');
+                                const currentTokens = JSON.parse(localStorage.getItem('copypaste_tokens') || '{}');
                                 res.tokens.forEach(t => currentTokens[t.id] = t.token);
-                                localStorage.setItem('ephemere_tokens', JSON.stringify(currentTokens));
+                                localStorage.setItem('copypaste_tokens', JSON.stringify(currentTokens));
                             } catch(err) {}
                             window.location.reload();
                         } else {
@@ -452,9 +445,17 @@ function getDelayMs(req) {
     return durationMin * 60 * 1000;
 }
 
-// SÉCURITÉ : Nettoyage multi-plateforme (Linux/Windows) de l'arborescence
+function verifyStorageLimitPostUpload(reqFiles) {
+    let incomingSize = 0;
+    reqFiles.forEach(f => incomingSize += f.size);
+    if (currentTotalSize + incomingSize > MAX_STORAGE_BYTES) {
+        reqFiles.forEach(f => safeUnlink(f.path));
+        return false;
+    }
+    return true;
+}
+
 function sanitizeRelativePath(unsafePath) {
-    // Supprime les null bytes et convertit les antislash (Windows) en slash (Linux)
     let clean = unsafePath.replace(/\0/g, '').replace(/\\/g, '/');
     clean = path.normalize(clean);
     if (clean.startsWith('..') || clean.startsWith('/')) {
@@ -464,7 +465,6 @@ function sanitizeRelativePath(unsafePath) {
 }
 
 app.post('/upload-files', upload.array('files'), (req, res) => {
-    // Le nettoyage en cas d'erreur de taille ou de connexion est déjà géré par l'intercepteur global et close event
     if (!req.files || req.files.length === 0) return res.status(400).send('Aucun fichier.');
     
     const delayMs = getDelayMs(req);
@@ -487,7 +487,6 @@ app.post('/upload-files', upload.array('files'), (req, res) => {
         tokens.push({ id, token: deleteToken });
     });
     
-    // Purge l'array des fichiers temporaires pour éviter qu'ils soient supprimés par res.on('finish')
     req.multerTempFiles = [];
     res.json({ tokens });
 });
@@ -500,7 +499,7 @@ app.post('/upload-folder', upload.array('files'), (req, res) => {
     const zipPath = path.join(UPLOAD_DIR, id);
     
     const output = fs.createWriteStream(zipPath);
-    const archive = archiver('zip', { zlib: { level: 0 } });
+    const archive = archiver('zip', { zlib: { level: 0 } }); 
 
     output.on('close', () => {
         const fileSize = archive.pointer();
@@ -515,7 +514,7 @@ app.post('/upload-folder', upload.array('files'), (req, res) => {
         scheduleDestruction(id, delayMs);
         
         req.files.forEach(f => safeUnlink(f.path));
-        req.multerTempFiles = []; // Déclare le succès
+        req.multerTempFiles = []; 
         res.json({ tokens: [{ id, token: deleteToken }] });
     });
 
@@ -530,6 +529,14 @@ app.post('/upload-folder', upload.array('files'), (req, res) => {
         archive.file(file.path, { name: safePath });
     });
     archive.finalize();
+
+    req.on('close', () => {
+        if (!res.writableEnded) {
+            archive.abort();
+            req.files.forEach(f => safeUnlink(f.path));
+            safeUnlink(zipPath);
+        }
+    });
 });
 
 app.post('/upload-text', upload.none(), (req, res) => {
@@ -571,7 +578,6 @@ app.post('/delete/:id', (req, res) => {
     const item = storedItems.get(req.params.id);
     if (!item) return res.status(404).send('Inconnu');
 
-    // SÉCURITÉ : Vérification de format avant de Bufferiser (évite les erreurs fatales)
     let clientTokenStr = req.body.token || '';
     if (typeof clientTokenStr !== 'string' || !/^[0-9a-f]{32}$/.test(clientTokenStr)) {
         return res.status(403).send('Jeton invalide.');
@@ -594,7 +600,6 @@ app.get('/view/:id', (req, res) => {
 
     res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'");
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    // SÉCURITÉ : Évite le plantage du serveur Express si le fichier est lu au moment même où il est supprimé
     res.sendFile(item.path, (err) => {
         if (err && !res.headersSent) res.status(500).end();
     });
@@ -611,9 +616,7 @@ app.get('/download/:id', (req, res) => {
     });
 });
 
-// Intercepteur Global Multicouche
 app.use((err, req, res, next) => {
-    // Si une erreur arrive, on nettoie les traces de Multer laissées en plan
     if (req.multerTempFiles) {
         req.multerTempFiles.forEach(f => safeUnlink(f));
         req.multerTempFiles = [];
@@ -630,5 +633,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Serveur minimaliste et blindé démarré sur http://localhost:${PORT}`);
+    console.log(`Serveur CopyPaste démarré sur http://localhost:${PORT}`);
 });

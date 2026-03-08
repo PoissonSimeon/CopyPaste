@@ -284,7 +284,7 @@ app.get('/', (req, res) => {
     </head>
     <body>
         <!-- CORRECTION : Ajout de l'ID storage-info pour la mise à jour en direct -->
-        <h1><span>CopyPaste</span> <span class="storage-info" id="storage-info">${(currentTotalSize / (1024 ** 3)).toFixed(2)} / 15 Go</span></h1>
+        <h1><span>CopyPaste (non chiffré)</span> <span class="storage-info" id="storage-info">${(currentTotalSize / (1024 ** 3)).toFixed(2)} / 15 Go</span></h1>
 
         <div class="settings">
             <div>⏳ Autodestruction : <input type="number" id="duration" min="1" max="15" value="5"> min</div>

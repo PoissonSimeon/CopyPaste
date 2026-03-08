@@ -14,10 +14,10 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
 try { fs.readdirSync(UPLOAD_DIR).forEach(f => fs.unlinkSync(path.join(UPLOAD_DIR, f))); } catch (err) {}
 
 // === LIMITES STRICTES PROXMOX (512Mo RAM, 1 Core) ===
-const MAX_STORAGE_BYTES = 15 * 1024 * 1024 * 1024; // 15 Go
+const MAX_STORAGE_BYTES = 15 * 1024 * 1024 * 1024; // 15 Go (Limite globale du serveur)
 const MAX_GLOBAL_FILES = 5000; 
-const MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024; // 2 Go
-const MAX_TEXT_SIZE = 2 * 1024 * 1024; // 2 Mo
+const MAX_FILE_SIZE = 14 * 1024 * 1024 * 1024; // MISE À JOUR : 14 Go max par fichier individuel
+const MAX_TEXT_SIZE = 2 * 1024 * 1024; // 2 Mo max pour le texte
 const ABSOLUTE_TIMEOUT_MS = 60 * 60 * 1000; 
 const MAX_SSE_CLIENTS = 100; 
 
@@ -623,7 +623,8 @@ app.use((err, req, res, next) => {
     }
 
     if (err instanceof multer.MulterError) {
-        if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).send("Un fichier dépasse la limite autorisée (2 Go max).");
+        // MISE À JOUR : Modification des messages d'erreur
+        if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).send("Un fichier dépasse la limite autorisée (14 Go max).");
         if (err.code === 'LIMIT_FIELD_SIZE') return res.status(413).send("Le texte est trop long (2 Mo max).");
         return res.status(400).send(`Erreur d'upload : ${err.message}`);
     } else if (err) {

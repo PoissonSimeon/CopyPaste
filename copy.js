@@ -16,7 +16,7 @@ try { fs.readdirSync(UPLOAD_DIR).forEach(f => fs.unlinkSync(path.join(UPLOAD_DIR
 // === LIMITES STRICTES PROXMOX (512Mo RAM, 1 Core) ===
 const MAX_STORAGE_BYTES = 15 * 1024 * 1024 * 1024; // 15 Go (Limite globale du serveur)
 const MAX_GLOBAL_FILES = 5000; 
-const MAX_FILE_SIZE = 14 * 1024 * 1024 * 1024; // MISE À JOUR : 14 Go max par fichier individuel
+const MAX_FILE_SIZE = 14 * 1024 * 1024 * 1024; // 14 Go max par fichier individuel
 const MAX_TEXT_SIZE = 2 * 1024 * 1024; // 2 Mo max pour le texte
 const ABSOLUTE_TIMEOUT_MS = 60 * 60 * 1000; 
 const MAX_SSE_CLIENTS = 100; 
@@ -129,8 +129,9 @@ app.get('/events', (req, res) => {
     });
 });
 
+// CORRECTION : Envoi de la nouvelle taille via SSE
 function broadcastDelete(id) {
-    const message = `data: ${JSON.stringify({ type: 'delete', id: id })}\n\n`;
+    const message = `data: ${JSON.stringify({ type: 'delete', id: id, newSize: currentTotalSize })}\n\n`;
     for (const client of connectedClients) client.write(message);
 }
 
@@ -171,6 +172,11 @@ function deleteItemData(id) {
         clearTimeout(item.timeoutId);
         clearTimeout(item.absoluteTimeoutId);
         storedItems.delete(id);
+        
+        // CORRECTION : On met à jour l'espace et les fichiers en mémoire vive instantanément
+        currentTotalSize = Math.max(0, currentTotalSize - item.size);
+        currentTotalFiles = Math.max(0, currentTotalFiles - 1);
+        
         safeUnlink(item.path);
         broadcastDelete(id);
     }
@@ -238,7 +244,7 @@ app.get('/', (req, res) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>CopyPaste (non chiffré)</title>
+        <title>CopyPaste</title>
         <style>
             :root { --bg: #ffffff; --text: #000000; --gray: #888888; --light-gray: #f5f5f5; --border: #eeeeee; --red: #d93025; }
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 600px; margin: 2rem auto; padding: 0 1rem; color: var(--text); background: var(--bg); line-height: 1.5; }
@@ -277,7 +283,8 @@ app.get('/', (req, res) => {
         </style>
     </head>
     <body>
-        <h1><span>CopyPaste</span> <span class="storage-info">${(currentTotalSize / (1024 ** 3)).toFixed(2)} / 15 Go</span></h1>
+        <!-- CORRECTION : Ajout de l'ID storage-info pour la mise à jour en direct -->
+        <h1><span>CopyPaste</span> <span class="storage-info" id="storage-info">${(currentTotalSize / (1024 ** 3)).toFixed(2)} / 15 Go</span></h1>
 
         <div class="settings">
             <div>⏳ Autodestruction : <input type="number" id="duration" min="1" max="15" value="5"> min</div>
@@ -336,6 +343,14 @@ app.get('/', (req, res) => {
                                 }
                             }
                         }, 300);
+                    }
+                    
+                    // CORRECTION : Mise à jour de la jauge en haut de page en temps réel
+                    if (data.newSize !== undefined) {
+                        const storageEl = document.getElementById('storage-info');
+                        if (storageEl) {
+                            storageEl.innerText = (data.newSize / (1024 ** 3)).toFixed(2) + ' / 15 Go';
+                        }
                     }
                 }
             };
@@ -623,7 +638,6 @@ app.use((err, req, res, next) => {
     }
 
     if (err instanceof multer.MulterError) {
-        // MISE À JOUR : Modification des messages d'erreur
         if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).send("Un fichier dépasse la limite autorisée (14 Go max).");
         if (err.code === 'LIMIT_FIELD_SIZE') return res.status(413).send("Le texte est trop long (2 Mo max).");
         return res.status(400).send(`Erreur d'upload : ${err.message}`);

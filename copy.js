@@ -9,40 +9,40 @@ const app = express();
 const PORT = 3000;
 const UPLOAD_DIR = path.join(__dirname, 'temp_uploads');
 
-// Création et nettoyage du dossier
+// Création et nettoyage du dossier au démarrage
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
 fs.readdirSync(UPLOAD_DIR).forEach(f => fs.unlinkSync(path.join(UPLOAD_DIR, f)));
 
-const MAX_STORAGE_BYTES = 32 * 1024 * 1024 * 1024; // 32 Go
-// Limite individuelle pour éviter de bloquer la RAM avec un seul fichier géant (ex: 5 Go max par fichier)
-const MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024; 
+const MAX_STORAGE_BYTES = 32 * 1024 * 1024 * 1024; // 32 Go globale
+const MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024; // 5 Go max par fichier individuel
+const ABSOLUTE_TIMEOUT_MS = 60 * 60 * 1000; // 1 heure max (Anti-Slowloris)
 
 let currentTotalSize = 0;
 const storedItems = new Map();
 const connectedClients = new Set();
 
-// Configuration sécurisée de Multer
 const storage = multer.diskStorage({
     destination: UPLOAD_DIR,
     filename: (req, file, cb) => {
         const uniqueId = crypto.randomBytes(8).toString('hex');
-        const safeName = path.basename(file.originalname); // Empêche le Path Traversal
+        const safeName = path.basename(file.originalname);
         cb(null, `${uniqueId}-${safeName}`);
     }
 });
 
+// SÉCURITÉ : Limites strictes au niveau de Multer
 const upload = multer({ 
     storage: storage,
     limits: { 
         fileSize: MAX_FILE_SIZE,
-        files: 1000 // Limite le nombre de fichiers par upload massif
+        fieldSize: 50 * 1024 * 1024, // Limite le texte collé à 50 Mo (évite le crash de buffer)
+        files: 2000 // Évite une attaque par saturation du nombre de fichiers (DDoS)
     }
 });
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// SÉCURITÉ : Fonction pour échapper les caractères dangereux (Prévention XSS)
 function escapeHtml(unsafe) {
     return (unsafe || '').toString()
          .replace(/&/g, "&amp;")
@@ -52,6 +52,7 @@ function escapeHtml(unsafe) {
          .replace(/'/g, "&#039;");
 }
 
+// SÉCURITÉ : Première barrière basée sur l'en-tête
 app.use((req, res, next) => {
     if (req.method === 'POST' && req.path.startsWith('/upload')) {
         const contentLength = parseInt(req.headers['content-length'] || '0', 10);
@@ -75,7 +76,6 @@ app.get('/events', (req, res) => {
 });
 
 function broadcastDelete(id) {
-    // id est généré par le serveur (hex), donc safe, mais stringify sécurise l'objet
     const message = `data: ${JSON.stringify({ type: 'delete', id: id })}\n\n`;
     for (const client of connectedClients) {
         client.write(message);
@@ -90,6 +90,9 @@ function scheduleDestruction(id, delayMs) {
         item.remainingMs = delayMs;
         item.expiresAt = Date.now() + delayMs;
         item.timeoutId = setTimeout(() => deleteItemData(id), delayMs);
+        
+        // SÉCURITÉ : "Kill switch" absolu pour empêcher les attaques Slowloris sur les téléchargements en pause
+        item.absoluteTimeoutId = setTimeout(() => deleteItemData(id), delayMs + ABSOLUTE_TIMEOUT_MS);
     }
 }
 
@@ -117,6 +120,8 @@ function resumeTimer(id) {
 function deleteItemData(id) {
     if (storedItems.has(id)) {
         const item = storedItems.get(id);
+        clearTimeout(item.timeoutId);
+        clearTimeout(item.absoluteTimeoutId);
         storedItems.delete(id);
         currentTotalSize -= item.size;
         fs.unlink(item.path, () => {});
@@ -128,7 +133,6 @@ function getPreviewHtml(item) {
     if (item.isText) {
         let content = '';
         try { content = fs.readFileSync(item.path, 'utf8'); } catch (e) { content = 'Erreur de lecture'; }
-        // Double sécurité ici avec escapeHtml
         return `
             <div class="preview-box text-content">${escapeHtml(content)}</div>
             <button class="btn-copy" onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copié !'; setTimeout(()=>this.innerText='Copier', 2000)">Copier</button>
@@ -136,7 +140,6 @@ function getPreviewHtml(item) {
     }
 
     const ext = path.extname(item.originalName).toLowerCase();
-    // L'ID est un hash généré par le serveur, il est safe pour l'URL
     if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) return `<img class="preview-media" src="/view/${item.id}" loading="lazy" alt="Aperçu">`;
     if (['.mp4', '.webm'].includes(ext)) return `<video class="preview-media" controls src="/view/${item.id}" preload="none"></video>`;
     if (['.mp3', '.wav', '.ogg'].includes(ext)) return `<audio class="preview-audio" controls src="/view/${item.id}" preload="none"></audio>`;
@@ -377,8 +380,21 @@ function getDelayMs(req) {
     return durationMin * 60 * 1000;
 }
 
+// SÉCURITÉ : Fonction de vérification ultime de la taille après upload (empêche la triche chunked)
+function verifyStorageLimitPostUpload(reqFiles) {
+    let incomingSize = 0;
+    reqFiles.forEach(f => incomingSize += f.size);
+    if (currentTotalSize + incomingSize > MAX_STORAGE_BYTES) {
+        reqFiles.forEach(f => fs.unlink(f.path, () => {})); // On supprime l'excès
+        return false;
+    }
+    return true;
+}
+
 app.post('/upload-files', upload.array('files'), (req, res) => {
     if (!req.files || req.files.length === 0) return res.status(400).send('Aucun fichier.');
+    if (!verifyStorageLimitPostUpload(req.files)) return res.status(413).send('Limite des 32 Go dépassée.');
+    
     const delayMs = getDelayMs(req);
     const tokens = [];
 
@@ -400,6 +416,7 @@ app.post('/upload-files', upload.array('files'), (req, res) => {
 
 app.post('/upload-folder', upload.array('files'), (req, res) => {
     if (!req.files || req.files.length === 0) return res.status(400).send('Dossier vide.');
+    if (!verifyStorageLimitPostUpload(req.files)) return res.status(413).send('Limite des 32 Go dépassée.');
     
     const delayMs = getDelayMs(req);
     const id = crypto.randomBytes(8).toString('hex') + '-archive.zip';
@@ -423,9 +440,14 @@ app.post('/upload-folder', upload.array('files'), (req, res) => {
         res.json({ tokens: [{ id, token: deleteToken }] });
     });
 
-    archive.on('error', (err) => res.status(500).send(err.message));
+    // SÉCURITÉ : Nettoyage en cas d'erreur de compression pour éviter les fichiers fantômes
+    archive.on('error', (err) => {
+        req.files.forEach(f => fs.unlink(f.path, () => {}));
+        fs.unlink(zipPath, () => {});
+        res.status(500).send(err.message);
+    });
+
     archive.pipe(output);
-    // SÉCURITÉ : on utilise path.basename pour s'assurer qu'aucun chemin relatif malveillant n'entre dans l'archive
     req.files.forEach(file => archive.file(file.path, { name: path.basename(file.originalname) }));
     archive.finalize();
 });
@@ -439,6 +461,9 @@ app.post('/upload-text', upload.none(), (req, res) => {
     const filePath = path.join(UPLOAD_DIR, id);
     const buffer = Buffer.from(textContent, 'utf-8');
     const fileSize = buffer.length;
+
+    // SÉCURITÉ : On vérifie l'espace avant d'écrire le texte sur le disque
+    if (currentTotalSize + fileSize > MAX_STORAGE_BYTES) return res.status(413).send('Limite des 32 Go dépassée.');
 
     fs.writeFile(filePath, buffer, (err) => {
         if (err) return res.status(500).send("Erreur de sauvegarde.");
@@ -468,10 +493,8 @@ app.get('/view/:id', (req, res) => {
     const item = storedItems.get(req.params.id);
     if (!item) return res.status(404).end();
 
-    // SÉCURITÉ : Bloque l'exécution de scripts si le fichier prévisualisé est un HTML/SVG piégé
     res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'");
     res.setHeader('X-Content-Type-Options', 'nosniff');
-
     res.sendFile(item.path);
 });
 

@@ -58,8 +58,9 @@ const storage = multer.diskStorage({
     destination: UPLOAD_DIR,
     filename: (req, file, cb) => {
         const uniqueId = crypto.randomBytes(8).toString('hex');
-        const safeName = path.basename(file.originalname);
-        const fullFilename = `chunk-${uniqueId}-${safeName}.tmp`;
+        // NOUVEAU : Récupère le fileId depuis le corps de la requête pour lier le .tmp au .part
+        const fileId = req.body.fileId || 'unknown';
+        const fullFilename = `chunk-${fileId}-${uniqueId}.tmp`;
         
         if (!req.multerTempFiles) req.multerTempFiles = [];
         req.multerTempFiles.push(path.join(UPLOAD_DIR, fullFilename));
@@ -251,6 +252,18 @@ app.post('/abort-upload', (req, res) => {
         const safeName = `${fileId}.part`;
         safeUnlink(path.join(UPLOAD_DIR, safeName));
         broadcastGhostDelete(safeName);
+        
+        // Supprime également les morceaux .tmp associés qui auraient pu rester bloqués
+        fs.readdir(UPLOAD_DIR, (err, files) => {
+            if (!err) {
+                files.forEach(f => {
+                    if (f.startsWith(`chunk-${fileId}-`) && f.endsWith('.tmp')) {
+                        safeUnlink(path.join(UPLOAD_DIR, f));
+                        broadcastGhostDelete(f);
+                    }
+                });
+            }
+        });
     }
     res.sendStatus(200);
 });
@@ -259,7 +272,12 @@ app.post('/delete-ghost/:filename', (req, res) => {
     const safeName = sanitizeRelativePath(req.params.filename);
     const filePath = path.join(UPLOAD_DIR, safeName);
     
-    const fileId = safeName.split('.')[0];
+    // Extrait l'ID de transfert qu'il s'agisse d'un .part ou d'un chunk-.tmp
+    let fileId = safeName.split('.')[0];
+    if (safeName.startsWith('chunk-')) {
+        fileId = safeName.split('-')[1];
+    }
+    
     const lastActive = activeTransfers.get(fileId) || 0;
     if (Date.now() - lastActive < 15000) {
         return res.status(403).send("Ce fichier est actuellement en cours de transfert.");
@@ -714,7 +732,13 @@ app.get('/', (req, res) => {
             function updateGhostUI() {
                 document.querySelectorAll('.ghost-item').forEach(el => {
                     const filename = el.id.replace('ghost-', '');
-                    const fileId = filename.split('.')[0];
+                    
+                    // Récupère l'identifiant partagé
+                    let fileId = filename.split('.')[0];
+                    if (filename.startsWith('chunk-')) {
+                        fileId = filename.split('-')[1];
+                    }
+                    
                     const btn = el.querySelector('.btn-delete');
                     if (btn) {
                         if (activeUploads.includes(fileId)) {
@@ -840,7 +864,7 @@ app.get('/', (req, res) => {
                     const chunk = file.size === 0 ? new Blob([]) : file.slice(uploadedBytesChunks, end);
 
                     const formData = new FormData();
-                    formData.append('chunk', chunk);
+                    // TRÈS IMPORTANT : Ajout du chunk en DERNIER pour que le serveur lise le fileId avant
                     formData.append('fileId', fileId);
                     formData.append('offset', uploadedBytesChunks); 
                     formData.append('totalSize', file.size);
@@ -850,6 +874,7 @@ app.get('/', (req, res) => {
                         formData.append('folderId', folderId);
                         formData.append('relativePath', file.webkitRelativePath || file.name);
                     }
+                    formData.append('chunk', chunk);
 
                     const response = await new Promise((resolve, reject) => {
                         const xhr = new XMLHttpRequest();

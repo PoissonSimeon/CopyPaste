@@ -4,7 +4,6 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const archiver = require('archiver');
-const { pipeline } = require('stream/promises');
 
 const app = express();
 const PORT = 3000;
@@ -14,7 +13,7 @@ const UPLOAD_DIR = path.join(__dirname, 'temp_uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
 try { fs.rmSync(UPLOAD_DIR, { recursive: true, force: true }); fs.mkdirSync(UPLOAD_DIR); } catch (err) {}
 
-// === LIMITES STRICTES ===
+// === LIMITES STRICTES PROXMOX ===
 const MAX_STORAGE_BYTES = 15 * 1024 * 1024 * 1024; // 15 Go
 const MAX_GLOBAL_FILES = 5000; 
 const ABSOLUTE_TIMEOUT_MS = 60 * 60 * 1000; // 1h
@@ -22,14 +21,22 @@ const MAX_SSE_CLIENTS = 100;
 
 let currentTotalSize = 0;
 let currentTotalFiles = 0;
+let reservedSize = 0;
 const storedItems = new Map();
 const connectedClients = new Set();
 
-// Multer gère uniquement la réception des morceaux de 50 Mo
+// Multer gère la réception des morceaux de 50 Mo
 const storage = multer.diskStorage({
     destination: UPLOAD_DIR,
     filename: (req, file, cb) => {
-        cb(null, `chunk-${crypto.randomBytes(8).toString('hex')}.tmp`);
+        const uniqueId = crypto.randomBytes(8).toString('hex');
+        const safeName = path.basename(file.originalname);
+        const fullFilename = `chunk-${uniqueId}-${safeName}.tmp`;
+        
+        if (!req.multerTempFiles) req.multerTempFiles = [];
+        req.multerTempFiles.push(path.join(UPLOAD_DIR, fullFilename));
+        
+        cb(null, fullFilename);
     }
 });
 
@@ -56,6 +63,42 @@ function safeUnlink(filePath) {
     if (!filePath || !fs.existsSync(filePath)) return;
     fs.unlink(filePath, () => {});
 }
+
+// Middleware global : Réservation d'espace (Sans casser le flux pour Multer !)
+app.use((req, res, next) => {
+    if (req.method === 'POST' && req.path.startsWith('/upload')) {
+        const contentLengthHeader = req.headers['content-length'];
+        if (!contentLengthHeader) return res.status(411).send("Code 411 : 'Content-Length' requis.");
+
+        const contentLength = Math.max(0, parseInt(contentLengthHeader, 10) || 0);
+        
+        if (currentTotalSize + reservedSize + contentLength > MAX_STORAGE_BYTES) {
+            return res.status(413).send("La limite de 15 Go est atteinte ou l'espace est temporairement réservé.");
+        }
+        if (currentTotalFiles >= MAX_GLOBAL_FILES) {
+            return res.status(503).send("Quota maximum de fichiers simultanés atteint.");
+        }
+        
+        req.reservedBytes = contentLength;
+        reservedSize += contentLength;
+
+        req.reservationReleased = false;
+        const cleanupRequest = () => {
+            if (!req.reservationReleased) {
+                reservedSize = Math.max(0, reservedSize - req.reservedBytes);
+                req.reservationReleased = true;
+            }
+            if (!res.writableEnded && req.multerTempFiles) {
+                req.multerTempFiles.forEach(f => safeUnlink(f));
+                req.multerTempFiles = [];
+            }
+        };
+
+        res.on('finish', cleanupRequest);
+        res.on('close', cleanupRequest);
+    }
+    next();
+});
 
 app.get('/events', (req, res) => {
     if (connectedClients.size >= MAX_SSE_CLIENTS) return res.status(503).end();
@@ -120,17 +163,17 @@ function deleteItemData(id) {
 
 function getPreviewHtml(item) {
     if (item.isText) {
-        return `<div class="preview-box text-content">${item.previewText}</div><button class="btn-copy" onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copié !'; setTimeout(()=>this.innerText='Copier', 2000)">Copier</button>`;
+        return `<div class="preview-box text-content">${item.previewText}</div><button class="btn-copy" onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copie'; setTimeout(()=>this.innerText='Copier', 2000)">Copier</button>`;
     }
     const ext = path.extname(item.originalName).toLowerCase();
-    if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) return `<img class="preview-media" src="/view/${item.id}" loading="lazy" alt="Aperçu">`;
+    if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) return `<img class="preview-media" src="/view/${item.id}" loading="lazy" alt="Apercu">`;
     if (['.mp4', '.webm'].includes(ext)) return `<video class="preview-media" controls src="/view/${item.id}" preload="none"></video>`;
     if (['.mp3', '.wav', '.ogg'].includes(ext)) return `<audio class="preview-audio" controls src="/view/${item.id}" preload="none"></audio>`;
     if (ext === '.pdf') return `<iframe class="preview-pdf" src="/view/${item.id}"></iframe>`;
-    return `<div class="preview-box">Aperçu indisponible</div>`;
+    return `<div class="preview-box">Apercu indisponible</div>`;
 }
 
-// Auto-Healer Asynchrone : Traque les morceaux abandonnés (Dossiers et .part)
+// Auto-Healer Asynchrone
 setInterval(async () => {
     try {
         let actualSize = 0;
@@ -160,36 +203,39 @@ setInterval(async () => {
     } catch (err) {}
 }, 15 * 60 * 1000);
 
-// --- NOUVEAU MOTEUR DE RÉCEPTION DES MORCEAUX (CHUNKS) ---
-
+// --- MOTEUR DE RÉCEPTION DES MORCEAUX (CHUNKS) ---
 app.post('/upload-chunk', upload.single('chunk'), async (req, res) => {
     if (!req.file) return res.status(400).send("Morceau manquant.");
     
     try {
         const { fileId, chunkIndex, totalChunks, filename, duration, folderId, relativePath } = req.body;
         
-        // SÉCURITÉ : Validation stricte des IDs pour éviter l'injection de chemin
         if (!/^[a-f0-9]{16}$/.test(fileId)) throw new Error("ID de fichier invalide.");
         if (folderId && !/^[a-f0-9]{16}$/.test(folderId)) throw new Error("ID de dossier invalide.");
 
         const chunkSize = req.file.size;
-        if (currentTotalSize + chunkSize > MAX_STORAGE_BYTES) throw new Error("Limite de 15 Go dépassée.");
+        if (currentTotalSize + chunkSize > MAX_STORAGE_BYTES) throw new Error("Limite de 15 Go depassee.");
         if (currentTotalFiles >= MAX_GLOBAL_FILES) throw new Error("Quota de fichiers atteint.");
 
-        // On colle le morceau à la fin du fichier partiel
+        // Fusion securisee compatible avec tous les Node.js
         const partPath = path.join(UPLOAD_DIR, `${fileId}.part`);
-        await pipeline(fs.createReadStream(req.file.path), fs.createWriteStream(partPath, { flags: 'a' }));
-        safeUnlink(req.file.path);
+        await new Promise((resolve, reject) => {
+            const readStream = fs.createReadStream(req.file.path);
+            const writeStream = fs.createWriteStream(partPath, { flags: 'a' });
+            readStream.on('error', reject);
+            writeStream.on('error', reject);
+            writeStream.on('finish', resolve);
+            readStream.pipe(writeStream);
+        });
         
+        safeUnlink(req.file.path); // Supprime le chunk temporaire
         currentTotalSize += chunkSize;
 
-        // Si c'est le dernier morceau du fichier
         if (parseInt(chunkIndex) === parseInt(totalChunks) - 1) {
             const delayMs = (parseInt(duration) || 5) * 60 * 1000;
             const safeName = sanitizeRelativePath(filename);
 
             if (folderId) {
-                // Le fichier appartient à un dossier
                 const folderPath = path.join(UPLOAD_DIR, folderId);
                 if (!fs.existsSync(folderPath)) fs.mkdirSync(folderPath, { recursive: true });
                 
@@ -199,7 +245,6 @@ app.post('/upload-chunk', upload.single('chunk'), async (req, res) => {
                 
                 return res.json({ status: 'chunk_ok', complete: true });
             } else {
-                // C'est un fichier seul, on finalise son upload
                 const finalId = crypto.randomBytes(8).toString('hex');
                 const finalPath = path.join(UPLOAD_DIR, `${finalId}-${safeName}`);
                 fs.renameSync(partPath, finalPath);
@@ -223,7 +268,6 @@ app.post('/upload-chunk', upload.single('chunk'), async (req, res) => {
     }
 });
 
-// Finalisation d'un dossier uploadé
 app.post('/finalize-folder', async (req, res) => {
     const { folderId, duration, folderName } = req.body;
     if (!/^[a-f0-9]{16}$/.test(folderId)) return res.status(400).send("ID invalide.");
@@ -237,11 +281,11 @@ app.post('/finalize-folder', async (req, res) => {
     const zipPath = path.join(UPLOAD_DIR, `${finalId}-${safeZipName}`);
 
     const output = fs.createWriteStream(zipPath);
-    const archive = archiver('zip', { zlib: { level: 0 } }); // Niveau 0 vital pour Proxmox 512Mo
+    const archive = archiver('zip', { zlib: { level: 0 } }); 
 
     output.on('close', () => {
         const zipSize = archive.pointer();
-        fs.rm(folderPath, { recursive: true, force: true }, () => {}); // On supprime le dossier source pour libérer l'espace
+        fs.rm(folderPath, { recursive: true, force: true }, () => {}); 
         
         currentTotalFiles++;
         const deleteToken = crypto.randomBytes(16).toString('hex');
@@ -261,7 +305,7 @@ app.post('/finalize-folder', async (req, res) => {
     });
 
     archive.pipe(output);
-    archive.directory(folderPath, false); // Zippe tout le contenu en préservant l'arborescence
+    archive.directory(folderPath, false); 
     archive.finalize();
 });
 
@@ -269,7 +313,7 @@ app.post('/upload-text', multer().none(), (req, res) => {
     if (!req.body || typeof req.body.text !== 'string' || req.body.text.trim() === '') return res.status(400).send('Texte vide.');
     
     const buffer = Buffer.from(req.body.text, 'utf-8');
-    if (currentTotalSize + buffer.length > MAX_STORAGE_BYTES) return res.status(413).send('Limite de 15 Go dépassée.');
+    if (currentTotalSize + buffer.length > MAX_STORAGE_BYTES) return res.status(413).send('Limite de 15 Go depassee.');
     
     const delayMs = (parseInt(req.body.duration) || 5) * 60 * 1000;
     const finalId = crypto.randomBytes(8).toString('hex');
@@ -283,7 +327,7 @@ app.post('/upload-text', multer().none(), (req, res) => {
     const safePreview = escapeHtml(buffer.toString('utf8', 0, Math.min(buffer.length, 2000))) + (buffer.length > 2000 ? '\n\n[...]' : '');
 
     storedItems.set(finalId, {
-        id: finalId, originalName: 'Texte collé', path: filePath, size: buffer.length,
+        id: finalId, originalName: 'Texte colle', path: filePath, size: buffer.length,
         isText: true, activeDownloads: 0, deleteToken, previewText: safePreview
     });
     scheduleDestruction(finalId, delayMs);
@@ -304,7 +348,7 @@ app.post('/delete/:id', (req, res) => {
         deleteItemData(req.params.id);
         res.sendStatus(200);
     } else {
-        res.status(403).send('Non autorisé ou expiré.');
+        res.status(403).send('Non autorise ou expire.');
     }
 });
 
@@ -318,12 +362,12 @@ app.get('/view/:id', (req, res) => {
 
 app.get('/download/:id', (req, res) => {
     const item = storedItems.get(req.params.id);
-    if (!item) return res.status(404).send('Expiré.');
+    if (!item) return res.status(404).send('Expire.');
     pauseTimer(item.id);
     res.download(item.path, item.originalName, () => resumeTimer(item.id));
 });
 
-// --- INTERFACE WEB (FRONTEND AVEC DÉCOUPAGE CHUNK) ---
+// --- INTERFACE WEB ---
 
 app.get('/', (req, res) => {
     const itemsHtml = Array.from(storedItems.values()).sort((a, b) => a.expiresAt - b.expiresAt).map(item => `
@@ -338,7 +382,7 @@ app.get('/', (req, res) => {
                 </div>
             </div>
             ${getPreviewHtml(item)}
-            ${!item.isText ? `<a class="btn-download" href="/download/${item.id}">Télécharger</a>` : ''}
+            ${!item.isText ? `<a class="btn-download" href="/download/${item.id}">Telecharger</a>` : ''}
         </li>
     `).join('') || '<p class="empty" id="empty-msg">Aucun fichier pour le moment.</p>';
 
@@ -392,21 +436,21 @@ app.get('/', (req, res) => {
 
         <div class="settings">
             <div>Autodestruction : <input type="number" id="duration" min="1" max="15" value="5"> min</div>
-            <button class="btn-refresh" onclick="window.location.reload()">Rafraîchir</button>
+            <button class="btn-refresh" onclick="window.location.reload()">Rafraichir</button>
         </div>
 
         <div id="progress-wrapper">
-            <div id="progress-text">Préparation de l'envoi...</div>
+            <div id="progress-text">Preparation de l'envoi...</div>
             <div class="progress-track"><div id="progress-bar"></div></div>
         </div>
 
         <div class="section">
             <div class="input-group">
-                <input type="file" id="input-files" multiple title="Sélectionner des fichiers">
+                <input type="file" id="input-files" multiple title="Selectionner des fichiers">
                 <button id="btn-files" onclick="startChunkedUpload(false)">Fichiers</button>
             </div>
             <div class="input-group">
-                <input type="file" id="input-folder" webkitdirectory directory multiple title="Sélectionner un dossier">
+                <input type="file" id="input-folder" webkitdirectory directory multiple title="Selectionner un dossier">
                 <button id="btn-folder" onclick="startChunkedUpload(true)">Dossier (ZIP)</button>
             </div>
             <div class="input-group" style="align-items: flex-start;">
@@ -420,8 +464,7 @@ app.get('/', (req, res) => {
         </ul>
 
         <script>
-            // --- GESTION DU CHUNKING CÔTÉ CLIENT (CONTOURNEMENT CLOUDFLARE) ---
-            const CHUNK_SIZE = 50 * 1024 * 1024; // Morceaux de 50 Mo
+            const CHUNK_SIZE = 50 * 1024 * 1024; 
 
             function generateUUID() {
                 return Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -496,7 +539,8 @@ app.get('/', (req, res) => {
 
             async function uploadSingleFile(file, duration, folderId, isFolder) {
                 const fileId = generateUUID();
-                const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+                // Assure toujours au moins 1 morceau meme pour un fichier vide de 0 octet
+                const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
                 let lastResponseData = null;
 
                 for (let i = 0; i < totalChunks; i++) {
@@ -549,7 +593,6 @@ app.get('/', (req, res) => {
                 }
             }
 
-            // --- GESTION DU RESTE DE L'UI ---
             window.addEventListener('DOMContentLoaded', () => {
                 document.getElementById('input-files').value = "";
                 document.getElementById('input-folder').value = "";
@@ -624,5 +667,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Serveur CopyPaste démarré sur http://localhost:${PORT}`);
+    console.log(`Serveur CopyPaste demarre sur http://localhost:${PORT}`);
 });

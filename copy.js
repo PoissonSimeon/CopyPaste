@@ -9,9 +9,18 @@ const app = express();
 const PORT = 3000;
 const UPLOAD_DIR = path.join(__dirname, 'temp_uploads');
 
+// Système universel de suppression de dossier (Compatible anciennes versions de Node.js)
+function deleteFolderRecursive(dirPath) {
+    if (!fs.existsSync(dirPath)) return;
+    try {
+        if (fs.rmSync) fs.rmSync(dirPath, { recursive: true, force: true });
+        else fs.rmdirSync(dirPath, { recursive: true });
+    } catch (e) {}
+}
+
 // Nettoyage au démarrage
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
-try { fs.rmSync(UPLOAD_DIR, { recursive: true, force: true }); fs.mkdirSync(UPLOAD_DIR); } catch (err) {}
+deleteFolderRecursive(UPLOAD_DIR);
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // === LIMITES STRICTES PROXMOX ===
 const MAX_STORAGE_BYTES = 15 * 1024 * 1024 * 1024; // 15 Go
@@ -52,7 +61,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({ 
     storage: storage,
-    limits: { fileSize: 40 * 1024 * 1024, files: 1 } // Ajusté pour sécuriser le serveur avec des blocs de 30Mo
+    limits: { fileSize: 100 * 1024 * 1024, files: 1 } 
 });
 
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
@@ -120,7 +129,6 @@ app.get('/events', (req, res) => {
     connectedClients.add(res);
     const heartbeat = setInterval(() => res.write(':\n\n'), 20000);
     
-    // SÉCURITÉ : Capture les erreurs de socket pour éviter un crash global de Node.js
     res.on('error', () => { clearInterval(heartbeat); connectedClients.delete(res); });
     req.on('close', () => { clearInterval(heartbeat); connectedClients.delete(res); });
 });
@@ -208,7 +216,7 @@ setInterval(async () => {
             const isAbandoned = (Date.now() - stats.mtimeMs) > timeoutLimit;
 
             if (dirent.isDirectory()) {
-                if (isAbandoned) fs.rm(fullPath, { recursive: true, force: true }, () => {});
+                if (isAbandoned) deleteFolderRecursive(fullPath);
             } else {
                 if (isAbandoned) {
                     safeUnlink(fullPath);
@@ -238,7 +246,6 @@ app.post('/delete-ghost/:filename', (req, res) => {
     const safeName = sanitizeRelativePath(req.params.filename);
     const filePath = path.join(UPLOAD_DIR, safeName);
     
-    // Protection Serveur : Interdit la suppression si un transfert est en cours sur ce fichier
     const fileId = safeName.split('.')[0];
     const lastActive = activeTransfers.get(fileId) || 0;
     if (Date.now() - lastActive < 15000) {
@@ -260,7 +267,6 @@ app.post('/delete-ghost/:filename', (req, res) => {
     }
 });
 
-// Endpoint pour vérifier où en est un transfert interrompu (Reprise)
 app.get('/check-upload/:fileId', (req, res) => {
     const fileId = req.params.fileId;
     const { folderId, relativePath } = req.query;
@@ -284,7 +290,6 @@ app.get('/check-upload/:fileId', (req, res) => {
     res.json({ uploadedBytes: 0 });
 });
 
-// Moteur de réception de morceaux
 app.post('/upload-chunk', upload.single('chunk'), async (req, res) => {
     if (!req.file) return res.status(400).send("Morceau manquant.");
     
@@ -299,12 +304,10 @@ app.post('/upload-chunk', upload.single('chunk'), async (req, res) => {
         if (currentTotalSize + chunkSize > MAX_STORAGE_BYTES) throw new Error("Limite de 15 Go dépassée.");
         if (currentTotalFiles >= MAX_GLOBAL_FILES) throw new Error("Quota de fichiers atteint.");
 
-        // Marque le fichier comme actif pour bloquer la suppression manuelle
         activeTransfers.set(fileId, Date.now());
 
         const partPath = path.join(UPLOAD_DIR, `${fileId}.part`);
         
-        // SÉCURITÉ REPRISE : Vérifie la synchro exacte
         let existingSize = fs.existsSync(partPath) ? fs.statSync(partPath).size : 0;
         if (existingSize !== offsetBytes) {
             throw new Error(`Désynchronisation (Attendu: ${offsetBytes}, Serveur: ${existingSize}). Reprise avortée.`);
@@ -377,13 +380,12 @@ app.post('/finalize-folder', async (req, res) => {
 
     const output = fs.createWriteStream(zipPath);
     
-    // CORRECTION CRITIQUE DU 0Mo: Utilisation de `store: true` au lieu de `zlib: level 0`
-    const archive = archiver('zip', { store: true }); 
+    // CORRECTION : Retour au niveau 1 pour la stabilité avec Archiver. Ne crashera pas le serveur.
+    const archive = archiver('zip', { zlib: { level: 1 } }); 
 
     output.on('close', () => {
-        // CORRECTION CRITIQUE : Lecture physique sur le disque pour garantir la taille
-        const zipSize = fs.statSync(zipPath).size; 
-        try { fs.rmSync(folderPath, { recursive: true, force: true }); } catch (e) {}
+        const zipSize = fs.existsSync(zipPath) ? fs.statSync(zipPath).size : 0; 
+        deleteFolderRecursive(folderPath);
         
         currentTotalFiles++;
         const deleteToken = crypto.randomBytes(16).toString('hex');
@@ -398,7 +400,7 @@ app.post('/finalize-folder', async (req, res) => {
 
     archive.on('error', (err) => {
         safeUnlink(zipPath);
-        try { fs.rmSync(folderPath, { recursive: true, force: true }); } catch (e) {}
+        deleteFolderRecursive(folderPath);
         if (!res.headersSent) res.status(500).send(err.message);
     });
 
@@ -408,8 +410,7 @@ app.post('/finalize-folder', async (req, res) => {
 
     req.on('close', () => {
         if (!res.writableEnded) {
-            archive.abort();
-            req.files && req.files.forEach(f => safeUnlink(f.path));
+            try { archive.abort(); } catch(e) {}
             safeUnlink(zipPath);
         }
     });
@@ -487,7 +488,6 @@ app.get('/download/:id', (req, res) => {
     });
 });
 
-// --- INTERFACE WEB PRINCIPALE ---
 app.get('/', (req, res) => {
     const itemsHtml = Array.from(storedItems.values()).sort((a, b) => a.expiresAt - b.expiresAt).map(item => `
         <li class="item" id="item-${item.id}" data-id="${item.id}">
@@ -629,8 +629,7 @@ app.get('/', (req, res) => {
         </ul>
 
         <script>
-            // RÉDUIT À 30Mo POUR ÉVITER L'OOM KILLER DE PROXMOX ET L'ERREUR 502 CLOUDFLARE
-            const CHUNK_SIZE = 30 * 1024 * 1024; 
+            const CHUNK_SIZE = 90 * 1024 * 1024; 
             let activeUploads = []; 
 
             async function generateFileId(file) {

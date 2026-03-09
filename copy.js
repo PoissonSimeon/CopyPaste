@@ -373,11 +373,14 @@ app.post('/finalize-folder', async (req, res) => {
     const zipPath = path.join(UPLOAD_DIR, `${finalId}-${safeZipName}`);
 
     const output = fs.createWriteStream(zipPath);
-    const archive = archiver('zip', { zlib: { level: 0 } }); 
+    
+    // CORRECTION CRITIQUE DU 0Mo: Utilisation de `store: true` au lieu de `zlib: level 0`
+    const archive = archiver('zip', { store: true }); 
 
     output.on('close', () => {
-        const zipSize = archive.pointer();
-        fs.rm(folderPath, { recursive: true, force: true }, () => {}); 
+        // CORRECTION CRITIQUE : Lecture physique sur le disque pour garantir la taille
+        const zipSize = fs.statSync(zipPath).size; 
+        fs.rmSync(folderPath, { recursive: true, force: true }); 
         
         currentTotalFiles++;
         const deleteToken = crypto.randomBytes(16).toString('hex');
@@ -392,7 +395,7 @@ app.post('/finalize-folder', async (req, res) => {
 
     archive.on('error', (err) => {
         safeUnlink(zipPath);
-        fs.rm(folderPath, { recursive: true, force: true }, () => {});
+        fs.rmSync(folderPath, { recursive: true, force: true });
         res.status(500).send(err.message);
     });
 
@@ -623,11 +626,9 @@ app.get('/', (req, res) => {
         </ul>
 
         <script>
-            // --- DÉCOUPAGE FLUIDE 90 Mo ET REPRISE SUR ERREUR ---
             const CHUNK_SIZE = 90 * 1024 * 1024; 
             let activeUploads = []; 
 
-            // Empreintes déterministes pour assurer la reprise des uploads et la bonne création du ZIP
             async function generateFileId(file) {
                 const msg = (file.webkitRelativePath || file.name) + file.size + file.lastModified;
                 if (window.crypto && crypto.subtle) {
@@ -659,7 +660,6 @@ app.get('/', (req, res) => {
                 ['btn-files', 'btn-folder', 'btn-text'].forEach(id => document.getElementById(id).disabled = isUploading);
             }
 
-            // Met à jour la liste des "En cours" pour bloquer visuellement le bouton Supprimer
             function updateGhostUI() {
                 document.querySelectorAll('.ghost-item').forEach(el => {
                     const filename = el.id.replace('ghost-', '');
@@ -738,7 +738,7 @@ app.get('/', (req, res) => {
                         
                         if (fileUploadStates[i] < file.size || file.size === 0) {
                             activeUploads.push(fileId);
-                            updateGhostUI(); // Sécurise immédiatement le bouton si le fantôme est affiché
+                            updateGhostUI(); 
                             
                             const data = await uploadSingleFile(file, duration, folderId, isFolder, fileId, fileUploadStates[i], (newFileBytes) => {
                                 fileUploadStates[i] = newFileBytes;
@@ -781,7 +781,6 @@ app.get('/', (req, res) => {
                 }
             }
 
-            // MOTEUR HAUTE FRÉQUENCE AVEC REPRISE
             async function uploadSingleFile(file, duration, folderId, isFolder, fileId, startingOffset, onProgress) {
                 let uploadedBytesChunks = startingOffset;
 
@@ -826,7 +825,7 @@ app.get('/', (req, res) => {
                     if (onProgress) onProgress(uploadedBytesChunks);
                     
                     if (response.complete || response.status === 'done') return response;
-                    if (file.size === 0) break; // Sortie forcée pour les fichiers vides
+                    if (file.size === 0) break; 
                 }
                 return null;
             }

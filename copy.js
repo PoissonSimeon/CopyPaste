@@ -52,7 +52,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({ 
     storage: storage,
-    limits: { fileSize: 100 * 1024 * 1024, files: 1 } // Marge à 100Mo pour les blocs de 90Mo
+    limits: { fileSize: 40 * 1024 * 1024, files: 1 } // Ajusté pour sécuriser le serveur avec des blocs de 30Mo
 });
 
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
@@ -119,6 +119,9 @@ app.get('/events', (req, res) => {
 
     connectedClients.add(res);
     const heartbeat = setInterval(() => res.write(':\n\n'), 20000);
+    
+    // SÉCURITÉ : Capture les erreurs de socket pour éviter un crash global de Node.js
+    res.on('error', () => { clearInterval(heartbeat); connectedClients.delete(res); });
     req.on('close', () => { clearInterval(heartbeat); connectedClients.delete(res); });
 });
 
@@ -380,7 +383,7 @@ app.post('/finalize-folder', async (req, res) => {
     output.on('close', () => {
         // CORRECTION CRITIQUE : Lecture physique sur le disque pour garantir la taille
         const zipSize = fs.statSync(zipPath).size; 
-        fs.rmSync(folderPath, { recursive: true, force: true }); 
+        try { fs.rmSync(folderPath, { recursive: true, force: true }); } catch (e) {}
         
         currentTotalFiles++;
         const deleteToken = crypto.randomBytes(16).toString('hex');
@@ -395,8 +398,8 @@ app.post('/finalize-folder', async (req, res) => {
 
     archive.on('error', (err) => {
         safeUnlink(zipPath);
-        fs.rmSync(folderPath, { recursive: true, force: true });
-        res.status(500).send(err.message);
+        try { fs.rmSync(folderPath, { recursive: true, force: true }); } catch (e) {}
+        if (!res.headersSent) res.status(500).send(err.message);
     });
 
     archive.pipe(output);
@@ -626,7 +629,8 @@ app.get('/', (req, res) => {
         </ul>
 
         <script>
-            const CHUNK_SIZE = 90 * 1024 * 1024; 
+            // RÉDUIT À 30Mo POUR ÉVITER L'OOM KILLER DE PROXMOX ET L'ERREUR 502 CLOUDFLARE
+            const CHUNK_SIZE = 30 * 1024 * 1024; 
             let activeUploads = []; 
 
             async function generateFileId(file) {

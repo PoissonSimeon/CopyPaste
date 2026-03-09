@@ -18,6 +18,20 @@ function deleteFolderRecursive(dirPath) {
     } catch (e) {}
 }
 
+function getFolderSize(dirPath) {
+    let size = 0;
+    if (fs.existsSync(dirPath)) {
+        try {
+            const files = fs.readdirSync(dirPath);
+            for (const file of files) {
+                const stats = fs.statSync(path.join(dirPath, file));
+                if (stats.isFile()) size += stats.size;
+            }
+        } catch(e) {}
+    }
+    return size;
+}
+
 // Nettoyage au démarrage
 deleteFolderRecursive(UPLOAD_DIR);
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -192,11 +206,11 @@ function getPreviewHtml(item) {
         return `<div class="preview-box text-content">${item.previewText}</div><button class="btn-copy" onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copié'; setTimeout(()=>this.innerText='Copier', 2000)">Copier</button>`;
     }
     const ext = path.extname(item.originalName).toLowerCase();
-    if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) return `<img class="preview-media" src="/view/${item.id}" loading="lazy" alt="Apercu">`;
+    if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) return `<img class="preview-media" src="/view/${item.id}" loading="lazy" alt="Aperçu">`;
     if (['.mp4', '.webm'].includes(ext)) return `<video class="preview-media" controls src="/view/${item.id}" preload="none"></video>`;
     if (['.mp3', '.wav', '.ogg'].includes(ext)) return `<audio class="preview-audio" controls src="/view/${item.id}" preload="none"></audio>`;
     if (ext === '.pdf') return `<iframe class="preview-pdf" src="/view/${item.id}"></iframe>`;
-    return `<div class="preview-box">Apercu indisponible</div>`;
+    return `<div class="preview-box">Aperçu indisponible</div>`;
 }
 
 // Auto-Healer : Nettoie les fichiers résiduels (15 min de grâce)
@@ -267,29 +281,43 @@ app.post('/delete-ghost/:filename', (req, res) => {
     }
 });
 
+// REÉCRITURE : Vérification de reprise d'upload, compatible avec le système Manifest
 app.get('/check-upload/:fileId', (req, res) => {
     const fileId = req.params.fileId;
-    const { folderId, relativePath } = req.query;
+    const { folderId, relativePath, totalSize } = req.query;
     
     if (!/^[a-f0-9]+$/.test(fileId)) return res.json({ uploadedBytes: 0 });
 
+    // 1. Cherche si le fichier partiel est en cours
     const partPath = path.join(UPLOAD_DIR, `${fileId}.part`);
     if (fs.existsSync(partPath)) {
         return res.json({ uploadedBytes: fs.statSync(partPath).size });
     }
     
-    if (folderId && relativePath) {
-        const safeFolderId = sanitizeRelativePath(folderId);
-        const safeRelative = sanitizeRelativePath(relativePath);
-        const finalPath = path.join(UPLOAD_DIR, safeFolderId, safeRelative);
-        if (fs.existsSync(finalPath)) {
-            return res.json({ uploadedBytes: fs.statSync(finalPath).size });
+    // 2. Cherche si le fichier est déjà finalisé dans le Manifest d'un dossier
+    if (folderId && /^[a-f0-9]+$/.test(folderId)) {
+        const manifestPath = path.join(UPLOAD_DIR, folderId, 'manifest.json');
+        if (fs.existsSync(manifestPath)) {
+            try {
+                const lines = fs.readFileSync(manifestPath, 'utf8').split('\n').filter(l => l.trim() !== '');
+                // Nettoie les slashs pour comparer exactement comme ils sont sauvés
+                let expectedZipPath = (relativePath || '').replace(/\\/g, '/').replace(/\.\.\//g, '');
+                
+                for (const line of lines) {
+                    const entry = JSON.parse(line);
+                    if (entry.zipPath === expectedZipPath) {
+                        // Le fichier est déjà complètement uploadé dans le dossier d'attente
+                        return res.json({ uploadedBytes: parseInt(totalSize, 10) || 0 });
+                    }
+                }
+            } catch(e) {}
         }
     }
     
     res.json({ uploadedBytes: 0 });
 });
 
+// REÉCRITURE : L'upload des morceaux avec construction du Manifest
 app.post('/upload-chunk', upload.single('chunk'), async (req, res) => {
     if (!req.file) return res.status(400).send("Morceau manquant.");
     
@@ -332,16 +360,28 @@ app.post('/upload-chunk', upload.single('chunk'), async (req, res) => {
             const safeName = sanitizeRelativePath(filename);
 
             if (folderId) {
+                // Système de Dossier: Enregistrement dans le Manifest sans créer d'arborescence complexe sur l'OS
+                if (!/^[a-f0-9]+$/.test(folderId)) throw new Error("ID de dossier invalide.");
+                
                 const folderPath = path.join(UPLOAD_DIR, folderId);
                 if (!fs.existsSync(folderPath)) fs.mkdirSync(folderPath, { recursive: true });
                 
-                const finalSubPath = path.join(folderPath, sanitizeRelativePath(relativePath || filename));
-                fs.mkdirSync(path.dirname(finalSubPath), { recursive: true });
+                // Donne un nom plat et sécurisé pour le disque
+                const safeTmpName = crypto.randomBytes(8).toString('hex') + '.file';
+                const finalSubPath = path.join(folderPath, safeTmpName);
                 fs.renameSync(partPath, finalSubPath);
+                
+                // Nettoie le chemin cible qui sera utilisé DANS le zip
+                let zipPathEntry = (relativePath || filename).replace(/\\/g, '/').replace(/\.\.\//g, '');
+                
+                // Ajoute au fichier manifest
+                const manifestPath = path.join(folderPath, 'manifest.json');
+                fs.appendFileSync(manifestPath, JSON.stringify({ tmpName: safeTmpName, zipPath: zipPathEntry }) + '\n');
                 
                 broadcastGhostDelete(`${fileId}.part`);
                 return res.json({ status: 'chunk_ok', complete: true });
             } else {
+                // Fichier Unique
                 const finalId = crypto.randomBytes(8).toString('hex');
                 const finalPath = path.join(UPLOAD_DIR, `${finalId}-${safeName}`);
                 fs.renameSync(partPath, finalPath);
@@ -366,12 +406,19 @@ app.post('/upload-chunk', upload.single('chunk'), async (req, res) => {
     }
 });
 
+// REÉCRITURE : Générateur de ZIP basé sur le Manifest
 app.post('/finalize-folder', async (req, res) => {
     const { folderId, duration, folderName } = req.body;
     if (!/^[a-f0-9]+$/.test(folderId)) return res.status(400).send("ID invalide.");
 
     const folderPath = path.join(UPLOAD_DIR, folderId);
     if (!fs.existsSync(folderPath)) return res.status(404).send("Dossier introuvable.");
+
+    const manifestPath = path.join(folderPath, 'manifest.json');
+    if (!fs.existsSync(manifestPath)) {
+        deleteFolderRecursive(folderPath);
+        return res.status(400).send("Dossier vide ou corrompu.");
+    }
 
     const delayMs = (parseInt(duration) || 5) * 60 * 1000;
     const safeZipName = sanitizeRelativePath(folderName || 'Dossier') + '.zip';
@@ -380,12 +427,16 @@ app.post('/finalize-folder', async (req, res) => {
 
     const output = fs.createWriteStream(zipPath);
     
-    // CORRECTION : Retour au niveau 1 pour la stabilité avec Archiver. Ne crashera pas le serveur.
-    const archive = archiver('zip', { zlib: { level: 1 } }); 
+    // store: true désactive la compression, indispensable pour la survie du Proxmox 512Mo
+    const archive = archiver('zip', { store: true }); 
 
     output.on('close', () => {
         const zipSize = fs.existsSync(zipPath) ? fs.statSync(zipPath).size : 0; 
+        
+        // On soustrait la taille des fichiers temporaires supprimés pour garder le compteur juste
+        const tempFolderSize = getFolderSize(folderPath);
         deleteFolderRecursive(folderPath);
+        currentTotalSize = Math.max(0, currentTotalSize - tempFolderSize);
         
         currentTotalFiles++;
         const deleteToken = crypto.randomBytes(16).toString('hex');
@@ -405,7 +456,20 @@ app.post('/finalize-folder', async (req, res) => {
     });
 
     archive.pipe(output);
-    archive.directory(folderPath, false); 
+    
+    // Lit le plan de construction et ajoute les fichiers
+    const lines = fs.readFileSync(manifestPath, 'utf8').split('\n').filter(l => l.trim() !== '');
+    for (const line of lines) {
+        try {
+            const entry = JSON.parse(line);
+            const filePath = path.join(folderPath, entry.tmpName);
+            if (fs.existsSync(filePath)) {
+                // archive.file place le fichier au bon endroit dans le ZIP
+                archive.file(filePath, { name: entry.zipPath });
+            }
+        } catch(e) {}
+    }
+    
     archive.finalize();
 
     req.on('close', () => {
@@ -629,7 +693,7 @@ app.get('/', (req, res) => {
         </ul>
 
         <script>
-            const CHUNK_SIZE = 90 * 1024 * 1024; 
+            const CHUNK_SIZE = 30 * 1024 * 1024; 
             let activeUploads = []; 
 
             async function generateFileId(file) {
@@ -722,7 +786,7 @@ app.get('/', (req, res) => {
                     const fileId = await generateFileId(file);
                     
                     let checkUrl = '/check-upload/' + fileId;
-                    if (isFolder) checkUrl += '?folderId=' + encodeURIComponent(folderId) + '&relativePath=' + encodeURIComponent(file.webkitRelativePath || file.name);
+                    if (isFolder) checkUrl += '?folderId=' + encodeURIComponent(folderId) + '&relativePath=' + encodeURIComponent(file.webkitRelativePath || file.name) + '&totalSize=' + file.size;
                     
                     try {
                         const checkRes = await fetch(checkUrl);
@@ -944,6 +1008,13 @@ app.get('/', (req, res) => {
     `;
     res.send(html);
 });
+
+function getDelayMs(req) {
+    let durationMin = parseInt(req.body.duration) || 5;
+    if (durationMin < 1) durationMin = 1;
+    if (durationMin > 15) durationMin = 15;
+    return durationMin * 60 * 1000;
+}
 
 app.use((err, req, res, next) => {
     if (req.multerTempFiles) {

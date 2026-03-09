@@ -16,7 +16,8 @@ try { fs.rmSync(UPLOAD_DIR, { recursive: true, force: true }); fs.mkdirSync(UPLO
 // === LIMITES STRICTES PROXMOX ===
 const MAX_STORAGE_BYTES = 15 * 1024 * 1024 * 1024; // 15 Go
 const MAX_GLOBAL_FILES = 5000; 
-const ABSOLUTE_TIMEOUT_MS = 60 * 60 * 1000; // 1h
+const ABSOLUTE_TIMEOUT_MS = 60 * 60 * 1000; // 1h pour les fichiers finis
+const PARTIAL_TIMEOUT_MS = 15 * 60 * 1000; // 15 min pour les morceaux abandonnés
 const MAX_SSE_CLIENTS = 100; 
 
 let currentTotalSize = 0;
@@ -25,7 +26,6 @@ let reservedSize = 0;
 const storedItems = new Map();
 const connectedClients = new Set();
 
-// Multer gère la réception des morceaux de 50 Mo
 const storage = multer.diskStorage({
     destination: UPLOAD_DIR,
     filename: (req, file, cb) => {
@@ -42,7 +42,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({ 
     storage: storage,
-    limits: { fileSize: 60 * 1024 * 1024, files: 1 } // Accepte un chunk jusqu'à 60Mo (marge de sécurité)
+    limits: { fileSize: 60 * 1024 * 1024, files: 1 }
 });
 
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
@@ -64,7 +64,6 @@ function safeUnlink(filePath) {
     fs.unlink(filePath, () => {});
 }
 
-// Middleware global : Réservation d'espace (Sans casser le flux pour Multer !)
 app.use((req, res, next) => {
     if (req.method === 'POST' && req.path.startsWith('/upload')) {
         const contentLengthHeader = req.headers['content-length'];
@@ -73,10 +72,10 @@ app.use((req, res, next) => {
         const contentLength = Math.max(0, parseInt(contentLengthHeader, 10) || 0);
         
         if (currentTotalSize + reservedSize + contentLength > MAX_STORAGE_BYTES) {
-            return res.status(413).send("La limite de 15 Go est atteinte ou l'espace est temporairement réservé.");
+            return res.status(413).send("La limite de 15 Go est atteinte ou l'espace est temporairement reserve.");
         }
         if (currentTotalFiles >= MAX_GLOBAL_FILES) {
-            return res.status(503).send("Quota maximum de fichiers simultanés atteint.");
+            return res.status(503).send("Quota maximum de fichiers simultanes atteint.");
         }
         
         req.reservedBytes = contentLength;
@@ -173,7 +172,7 @@ function getPreviewHtml(item) {
     return `<div class="preview-box">Apercu indisponible</div>`;
 }
 
-// Auto-Healer Asynchrone
+// Auto-Healer Ajusté : Nettoie les .part en 15 minutes max
 setInterval(async () => {
     try {
         let actualSize = 0;
@@ -184,14 +183,17 @@ setInterval(async () => {
         for (const dirent of entries) {
             const fullPath = path.join(UPLOAD_DIR, dirent.name);
             const stats = await fs.promises.stat(fullPath);
-            const isAbandoned = (Date.now() - stats.mtimeMs) > ABSOLUTE_TIMEOUT_MS;
+            
+            const isPartial = dirent.name.endsWith('.part') || dirent.name.endsWith('.tmp');
+            const timeoutLimit = isPartial ? PARTIAL_TIMEOUT_MS : ABSOLUTE_TIMEOUT_MS;
+            const isAbandoned = (Date.now() - stats.mtimeMs) > timeoutLimit;
 
             if (dirent.isDirectory()) {
                 if (isAbandoned) fs.rm(fullPath, { recursive: true, force: true }, () => {});
             } else {
-                if ((dirent.name.endsWith('.part') || dirent.name.endsWith('.tmp')) && isAbandoned) {
+                if (isPartial && isAbandoned) {
                     safeUnlink(fullPath);
-                } else if (!dirent.name.endsWith('.part') && !dirent.name.endsWith('.tmp')) {
+                } else if (!isPartial) {
                     const id = dirent.name.split('-')[0];
                     if (!activeIds.has(id) && isAbandoned) safeUnlink(fullPath);
                     else if (activeIds.has(id)) { actualSize += stats.size; actualFiles++; }
@@ -202,6 +204,15 @@ setInterval(async () => {
         currentTotalFiles = actualFiles;
     } catch (err) {}
 }, 15 * 60 * 1000);
+
+// NOUVEAU : Route d'annulation immédiate demandée par le navigateur
+app.post('/abort-upload', (req, res) => {
+    const { fileId } = req.body;
+    if (fileId && /^[a-f0-9]{16}$/.test(fileId)) {
+        safeUnlink(path.join(UPLOAD_DIR, `${fileId}.part`));
+    }
+    res.sendStatus(200);
+});
 
 // --- MOTEUR DE RÉCEPTION DES MORCEAUX (CHUNKS) ---
 app.post('/upload-chunk', upload.single('chunk'), async (req, res) => {
@@ -217,7 +228,6 @@ app.post('/upload-chunk', upload.single('chunk'), async (req, res) => {
         if (currentTotalSize + chunkSize > MAX_STORAGE_BYTES) throw new Error("Limite de 15 Go depassee.");
         if (currentTotalFiles >= MAX_GLOBAL_FILES) throw new Error("Quota de fichiers atteint.");
 
-        // Fusion securisee compatible avec tous les Node.js
         const partPath = path.join(UPLOAD_DIR, `${fileId}.part`);
         await new Promise((resolve, reject) => {
             const readStream = fs.createReadStream(req.file.path);
@@ -228,7 +238,7 @@ app.post('/upload-chunk', upload.single('chunk'), async (req, res) => {
             readStream.pipe(writeStream);
         });
         
-        safeUnlink(req.file.path); // Supprime le chunk temporaire
+        safeUnlink(req.file.path); 
         currentTotalSize += chunkSize;
 
         if (parseInt(chunkIndex) === parseInt(totalChunks) - 1) {
@@ -368,7 +378,6 @@ app.get('/download/:id', (req, res) => {
 });
 
 // --- INTERFACE WEB ---
-
 app.get('/', (req, res) => {
     const itemsHtml = Array.from(storedItems.values()).sort((a, b) => a.expiresAt - b.expiresAt).map(item => `
         <li class="item" id="item-${item.id}" data-id="${item.id}">
@@ -465,6 +474,7 @@ app.get('/', (req, res) => {
 
         <script>
             const CHUNK_SIZE = 50 * 1024 * 1024; 
+            let activeUploads = []; // Suivi des envois en cours pour nettoyage d'urgence
 
             function generateUUID() {
                 return Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -497,6 +507,7 @@ app.get('/', (req, res) => {
                 const globalTokens = JSON.parse(localStorage.getItem('copypaste_tokens') || '{}');
 
                 setUIUploading(true);
+                activeUploads = [];
 
                 try {
                     if (isFolder) {
@@ -504,9 +515,13 @@ app.get('/', (req, res) => {
                         let folderName = files[0].webkitRelativePath.split('/')[0] || 'Dossier';
                         
                         for (const file of files) {
-                            await uploadSingleFile(file, duration, folderId, isFolder);
-                            uploadedBytes += file.size;
-                            updateProgress(uploadedBytes, totalBytes, startTime);
+                            const fileId = generateUUID();
+                            activeUploads.push(fileId);
+                            
+                            await uploadSingleFile(file, duration, folderId, isFolder, fileId, (chunkSize) => {
+                                uploadedBytes += chunkSize;
+                                updateProgress(uploadedBytes, totalBytes, startTime);
+                            });
                         }
                         
                         document.getElementById('progress-text').innerText = 'Compression du dossier ZIP sur le serveur...';
@@ -522,24 +537,36 @@ app.get('/', (req, res) => {
 
                     } else {
                         for (const file of files) {
-                            const data = await uploadSingleFile(file, duration, null, false);
+                            const fileId = generateUUID();
+                            activeUploads.push(fileId);
+
+                            const data = await uploadSingleFile(file, duration, null, false, fileId, (chunkSize) => {
+                                uploadedBytes += chunkSize;
+                                updateProgress(uploadedBytes, totalBytes, startTime);
+                            });
                             if (data && data.tokens) data.tokens.forEach(t => globalTokens[t.id] = t.token);
-                            uploadedBytes += file.size;
-                            updateProgress(uploadedBytes, totalBytes, startTime);
                         }
                     }
 
+                    activeUploads = []; // Succès, on vide la liste
                     localStorage.setItem('copypaste_tokens', JSON.stringify(globalTokens));
                     window.location.reload();
                 } catch (err) {
                     alert("Erreur: " + err.message);
                     setUIUploading(false);
+                    // Nettoyage immédiat sur le serveur en cas d'erreur
+                    activeUploads.forEach(id => {
+                        fetch('/abort-upload', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ fileId: id })
+                        }).catch(() => {});
+                    });
+                    activeUploads = [];
                 }
             }
 
-            async function uploadSingleFile(file, duration, folderId, isFolder) {
-                const fileId = generateUUID();
-                // Assure toujours au moins 1 morceau meme pour un fichier vide de 0 octet
+            async function uploadSingleFile(file, duration, folderId, isFolder, fileId, onProgress) {
                 const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
                 let lastResponseData = null;
 
@@ -563,6 +590,9 @@ app.get('/', (req, res) => {
                     const res = await fetch('/upload-chunk', { method: 'POST', body: formData });
                     if (!res.ok) throw new Error(await res.text());
                     lastResponseData = await res.json();
+                    
+                    // Mise à jour de la barre à CHAQUE morceau de 50 Mo
+                    if (onProgress) onProgress(chunk.size);
                 }
                 return lastResponseData;
             }
@@ -597,6 +627,16 @@ app.get('/', (req, res) => {
                 document.getElementById('input-files').value = "";
                 document.getElementById('input-folder').value = "";
                 document.getElementById('input-text').value = "";
+            });
+
+            // Bouton de détresse si l'utilisateur ferme l'onglet pendant l'upload
+            window.addEventListener('beforeunload', () => {
+                if (activeUploads.length > 0) {
+                    activeUploads.forEach(id => {
+                        const blob = new Blob([JSON.stringify({ fileId: id })], { type: 'application/json' });
+                        navigator.sendBeacon('/abort-upload', blob);
+                    });
+                }
             });
 
             const eventSource = new EventSource('/events');
@@ -662,7 +702,17 @@ app.get('/', (req, res) => {
 });
 
 app.use((err, req, res, next) => {
-    if (err) return res.status(500).send("Erreur serveur inattendue.");
+    if (req.multerTempFiles) {
+        req.multerTempFiles.forEach(f => safeUnlink(f));
+        req.multerTempFiles = [];
+    }
+    if (err instanceof multer.MulterError) {
+        if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).send("Un fichier dépasse la limite autorisee (14 Go max).");
+        if (err.code === 'LIMIT_FIELD_SIZE') return res.status(413).send("Le texte est trop long (2 Mo max).");
+        return res.status(400).send(`Erreur d'upload : ${err.message}`);
+    } else if (err) {
+        return res.status(500).send("Erreur serveur : Le transfert a ete interrompu.");
+    }
     next();
 });
 

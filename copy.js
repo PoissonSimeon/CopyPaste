@@ -9,7 +9,7 @@ const app = express();
 const PORT = 3000;
 const UPLOAD_DIR = path.join(__dirname, 'temp_uploads');
 
-// Nettoyage au demarrage
+// Nettoyage au démarrage
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
 try { fs.rmSync(UPLOAD_DIR, { recursive: true, force: true }); fs.mkdirSync(UPLOAD_DIR); } catch (err) {}
 
@@ -17,7 +17,7 @@ try { fs.rmSync(UPLOAD_DIR, { recursive: true, force: true }); fs.mkdirSync(UPLO
 const MAX_STORAGE_BYTES = 15 * 1024 * 1024 * 1024; // 15 Go
 const MAX_GLOBAL_FILES = 5000; 
 const ABSOLUTE_TIMEOUT_MS = 60 * 60 * 1000; // 1h pour les fichiers finis
-const PARTIAL_TIMEOUT_MS = 15 * 60 * 1000; // 15 min pour les morceaux abandonnes
+const PARTIAL_TIMEOUT_MS = 15 * 60 * 1000; // 15 min pour les morceaux abandonnés
 const MAX_SSE_CLIENTS = 100; 
 
 let currentTotalSize = 0;
@@ -25,6 +25,16 @@ let currentTotalFiles = 0;
 let reservedSize = 0;
 const storedItems = new Map();
 const connectedClients = new Set();
+
+// SÉCURITÉ : Traceur d'activité pour protéger les uploads en cours de la suppression
+const activeTransfers = new Map();
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, timestamp] of activeTransfers.entries()) {
+        if (now - timestamp > 60000) activeTransfers.delete(id); // Nettoie la RAM des vieux traceurs
+    }
+}, 60000);
 
 const storage = multer.diskStorage({
     destination: UPLOAD_DIR,
@@ -42,7 +52,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({ 
     storage: storage,
-    limits: { fileSize: 100 * 1024 * 1024, files: 1 } // Marge a 100Mo pour les blocs de 90Mo
+    limits: { fileSize: 100 * 1024 * 1024, files: 1 } // Marge à 100Mo pour les blocs de 90Mo
 });
 
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
@@ -72,10 +82,10 @@ app.use((req, res, next) => {
         const contentLength = Math.max(0, parseInt(contentLengthHeader, 10) || 0);
         
         if (currentTotalSize + reservedSize + contentLength > MAX_STORAGE_BYTES) {
-            return res.status(413).send("La limite de 15 Go est atteinte ou l'espace est temporairement reserve.");
+            return res.status(413).send("La limite de 15 Go est atteinte ou l'espace est temporairement réservé.");
         }
         if (currentTotalFiles >= MAX_GLOBAL_FILES) {
-            return res.status(503).send("Quota maximum de fichiers simultanes atteint.");
+            return res.status(503).send("Quota maximum de fichiers simultanés atteint.");
         }
         
         req.reservedBytes = contentLength;
@@ -99,7 +109,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// --- TEMPS REEL (SSE) ---
+// --- TEMPS RÉEL (SSE) ---
 app.get('/events', (req, res) => {
     if (connectedClients.size >= MAX_SSE_CLIENTS) return res.status(503).end();
     res.setHeader('Content-Type', 'text/event-stream');
@@ -168,7 +178,7 @@ function deleteItemData(id) {
 
 function getPreviewHtml(item) {
     if (item.isText) {
-        return `<div class="preview-box text-content">${item.previewText}</div><button class="btn-copy" onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copie'; setTimeout(()=>this.innerText='Copier', 2000)">Copier</button>`;
+        return `<div class="preview-box text-content">${item.previewText}</div><button class="btn-copy" onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copié'; setTimeout(()=>this.innerText='Copier', 2000)">Copier</button>`;
     }
     const ext = path.extname(item.originalName).toLowerCase();
     if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) return `<img class="preview-media" src="/view/${item.id}" loading="lazy" alt="Apercu">`;
@@ -178,7 +188,7 @@ function getPreviewHtml(item) {
     return `<div class="preview-box">Apercu indisponible</div>`;
 }
 
-// Auto-Healer : Nettoie les fichiers residuels (15 min de grace)
+// Auto-Healer : Nettoie les fichiers résiduels (15 min de grâce)
 setInterval(async () => {
     try {
         let actualSize = 0;
@@ -213,7 +223,7 @@ setInterval(async () => {
 
 app.post('/abort-upload', (req, res) => {
     const { fileId } = req.body;
-    if (fileId && /^[a-f0-9]{16,24}$/.test(fileId)) {
+    if (fileId && /^[a-f0-9]+$/.test(fileId)) {
         const safeName = `${fileId}.part`;
         safeUnlink(path.join(UPLOAD_DIR, safeName));
         broadcastGhostDelete(safeName);
@@ -225,8 +235,15 @@ app.post('/delete-ghost/:filename', (req, res) => {
     const safeName = sanitizeRelativePath(req.params.filename);
     const filePath = path.join(UPLOAD_DIR, safeName);
     
+    // Protection Serveur : Interdit la suppression si un transfert est en cours sur ce fichier
+    const fileId = safeName.split('.')[0];
+    const lastActive = activeTransfers.get(fileId) || 0;
+    if (Date.now() - lastActive < 15000) {
+        return res.status(403).send("Ce fichier est actuellement en cours de transfert.");
+    }
+    
     const activePaths = new Set(Array.from(storedItems.values()).map(i => path.basename(i.path)));
-    if (activePaths.has(safeName)) return res.status(403).send("Ce fichier est en ligne et finalise.");
+    if (activePaths.has(safeName)) return res.status(403).send("Ce fichier est en ligne et finalisé.");
 
     if (fs.existsSync(filePath)) {
         const size = fs.statSync(filePath).size;
@@ -240,7 +257,7 @@ app.post('/delete-ghost/:filename', (req, res) => {
     }
 });
 
-// NOUVEAU : Endpoint pour verifier ou en est un transfert interrompu
+// Endpoint pour vérifier où en est un transfert interrompu (Reprise)
 app.get('/check-upload/:fileId', (req, res) => {
     const fileId = req.params.fileId;
     const { folderId, relativePath } = req.query;
@@ -264,7 +281,7 @@ app.get('/check-upload/:fileId', (req, res) => {
     res.json({ uploadedBytes: 0 });
 });
 
-// Moteur de reception de morceaux (Mise a jour pour la reprise)
+// Moteur de réception de morceaux
 app.post('/upload-chunk', upload.single('chunk'), async (req, res) => {
     if (!req.file) return res.status(400).send("Morceau manquant.");
     
@@ -276,15 +293,18 @@ app.post('/upload-chunk', upload.single('chunk'), async (req, res) => {
         if (!/^[a-f0-9]+$/.test(fileId)) throw new Error("ID de fichier invalide.");
 
         const chunkSize = req.file.size;
-        if (currentTotalSize + chunkSize > MAX_STORAGE_BYTES) throw new Error("Limite de 15 Go depassee.");
+        if (currentTotalSize + chunkSize > MAX_STORAGE_BYTES) throw new Error("Limite de 15 Go dépassée.");
         if (currentTotalFiles >= MAX_GLOBAL_FILES) throw new Error("Quota de fichiers atteint.");
+
+        // Marque le fichier comme actif pour bloquer la suppression manuelle
+        activeTransfers.set(fileId, Date.now());
 
         const partPath = path.join(UPLOAD_DIR, `${fileId}.part`);
         
-        // SECURITE REPRISE : Verifie que le serveur et le client sont synchronises sur l'octet exact
+        // SÉCURITÉ REPRISE : Vérifie la synchro exacte
         let existingSize = fs.existsSync(partPath) ? fs.statSync(partPath).size : 0;
         if (existingSize !== offsetBytes) {
-            throw new Error(`Desynchronisation (Attendu: ${offsetBytes}, Serveur: ${existingSize}). Reprise avortee.`);
+            throw new Error(`Désynchronisation (Attendu: ${offsetBytes}, Serveur: ${existingSize}). Reprise avortée.`);
         }
 
         await new Promise((resolve, reject) => {
@@ -336,7 +356,7 @@ app.post('/upload-chunk', upload.single('chunk'), async (req, res) => {
         res.json({ status: 'chunk_ok', complete: false });
     } catch (err) {
         if (req.file) safeUnlink(req.file.path);
-        res.status(err.message.includes('Desynchronisation') ? 409 : 400).send(err.message);
+        res.status(err.message.includes('Désynchronisation') ? 409 : 400).send(err.message);
     }
 });
 
@@ -400,7 +420,7 @@ app.post('/upload-text', multer().none(), (req, res) => {
     const buffer = Buffer.from(textContent, 'utf-8');
     const fileSize = buffer.length;
 
-    if (currentTotalSize + fileSize > MAX_STORAGE_BYTES) return res.status(413).send('Limite de 15 Go depassee.');
+    if (currentTotalSize + fileSize > MAX_STORAGE_BYTES) return res.status(413).send('Limite de 15 Go dépassée.');
     if (currentTotalFiles >= MAX_GLOBAL_FILES) return res.status(503).send("Trop de fichiers.");
 
     fs.writeFileSync(filePath, buffer);
@@ -411,10 +431,10 @@ app.post('/upload-text', multer().none(), (req, res) => {
     const previewLimit = 2000;
     const isTruncated = buffer.length > previewLimit;
     const previewRaw = buffer.toString('utf8', 0, Math.min(buffer.length, previewLimit));
-    const safePreview = escapeHtml(previewRaw) + (isTruncated ? '\n\n<em style="color:#888;">[... Apercu tronque, copiez ou telechargez pour lire la suite ...]</em>' : '');
+    const safePreview = escapeHtml(previewRaw) + (isTruncated ? '\n\n<em style="color:#888;">[... Aperçu tronqué, copiez ou téléchargez pour lire la suite ...]</em>' : '');
 
     storedItems.set(id, {
-        id: id, originalName: 'Texte colle', path: filePath, size: fileSize,
+        id: id, originalName: 'Texte collé', path: filePath, size: fileSize,
         isText: true, activeDownloads: 0, deleteToken, previewText: safePreview
     });
     scheduleDestruction(id, delayMs);
@@ -435,7 +455,7 @@ app.post('/delete/:id', (req, res) => {
         deleteItemData(req.params.id);
         res.sendStatus(200);
     } else {
-        res.status(403).send('Non autorise ou expire.');
+        res.status(403).send('Non autorisé ou expiré.');
     }
 });
 
@@ -452,7 +472,7 @@ app.get('/view/:id', (req, res) => {
 
 app.get('/download/:id', (req, res) => {
     const item = storedItems.get(req.params.id);
-    if (!item) return res.status(404).send('Expire.');
+    if (!item) return res.status(404).send('Expiré.');
 
     pauseTimer(item.id);
     res.download(item.path, item.originalName, (err) => {
@@ -463,7 +483,6 @@ app.get('/download/:id', (req, res) => {
 
 // --- INTERFACE WEB PRINCIPALE ---
 app.get('/', (req, res) => {
-    // 1. Calcul des elements normaux
     const itemsHtml = Array.from(storedItems.values()).sort((a, b) => a.expiresAt - b.expiresAt).map(item => `
         <li class="item" id="item-${item.id}" data-id="${item.id}">
             <div class="item-header">
@@ -476,11 +495,10 @@ app.get('/', (req, res) => {
                 </div>
             </div>
             ${getPreviewHtml(item)}
-            ${!item.isText ? `<a class="btn-download" href="/download/${item.id}">Telecharger</a>` : ''}
+            ${!item.isText ? `<a class="btn-download" href="/download/${item.id}">Télécharger</a>` : ''}
         </li>
     `).join('') || '<p class="empty" id="empty-msg">Aucun fichier pour le moment.</p>';
 
-    // 2. Traque et affichage des Fichiers Residuels
     let actualSize = 0;
     const activePaths = new Set(Array.from(storedItems.values()).map(i => path.basename(i.path)));
     const allFiles = fs.readdirSync(UPLOAD_DIR);
@@ -510,7 +528,7 @@ app.get('/', (req, res) => {
         <li class="item ghost-item" id="ghost-${escapeHtml(g.filename)}">
             <div class="item-header">
                 <div class="item-info">
-                    <span class="item-title" style="color: #888;">[En pause / Residuel] ${escapeHtml(g.filename)}</span>
+                    <span class="item-title" style="color: #888;">[Résiduel / En pause] ${escapeHtml(g.filename)}</span>
                     <span class="size">(${(g.size / 1024 / 1024).toFixed(2)} Mo)</span>
                 </div>
                 <div class="item-actions">
@@ -519,7 +537,7 @@ app.get('/', (req, res) => {
                 </div>
             </div>
         </li>
-    `).join('') || '<p class="empty" id="ghost-empty-msg">Aucun fichier residuel.</p>';
+    `).join('') || '<p class="empty" id="ghost-empty-msg">Aucun fichier résiduel.</p>';
 
     const html = `
     <!DOCTYPE html>
@@ -572,21 +590,21 @@ app.get('/', (req, res) => {
 
         <div class="settings">
             <div>Autodestruction : <input type="number" id="duration" min="1" max="15" value="5"> min</div>
-            <button class="btn-refresh" onclick="window.location.reload()">Rafraichir</button>
+            <button class="btn-refresh" onclick="window.location.reload()">Rafraîchir</button>
         </div>
 
         <div id="progress-wrapper">
-            <div id="progress-text">Preparation de l'envoi...</div>
+            <div id="progress-text">Préparation de l'envoi...</div>
             <div class="progress-track"><div id="progress-bar"></div></div>
         </div>
 
         <div class="section">
             <div class="input-group">
-                <input type="file" id="input-files" multiple title="Selectionner des fichiers">
+                <input type="file" id="input-files" multiple title="Sélectionner des fichiers">
                 <button id="btn-files" onclick="startChunkedUpload(false)">Fichiers</button>
             </div>
             <div class="input-group">
-                <input type="file" id="input-folder" webkitdirectory directory multiple title="Selectionner un dossier">
+                <input type="file" id="input-folder" webkitdirectory directory multiple title="Sélectionner un dossier">
                 <button id="btn-folder" onclick="startChunkedUpload(true)">Dossier (ZIP)</button>
             </div>
             <div class="input-group" style="align-items: flex-start;">
@@ -599,7 +617,7 @@ app.get('/', (req, res) => {
             ${itemsHtml}
         </ul>
 
-        <h2>Fichiers residuels / En pause</h2>
+        <h2>Fichiers résiduels / En pause</h2>
         <ul id="ghost-list">
             ${ghostsHtml}
         </ul>
@@ -609,26 +627,22 @@ app.get('/', (req, res) => {
             const CHUNK_SIZE = 90 * 1024 * 1024; 
             let activeUploads = []; 
 
-            // Generation d'empreinte unique pour identifier un fichier lors d'une reprise
+            // Empreintes déterministes pour assurer la reprise des uploads et la bonne création du ZIP
             async function generateFileId(file) {
-                let salt = localStorage.getItem('copypaste_salt') || Math.random().toString(36).substring(2);
-                localStorage.setItem('copypaste_salt', salt);
-                const relPath = file.webkitRelativePath || file.name;
-                const msg = salt + relPath + file.size + file.lastModified;
-                
+                const msg = (file.webkitRelativePath || file.name) + file.size + file.lastModified;
                 if (window.crypto && crypto.subtle) {
                     const buffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(msg));
                     return Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 16);
                 } else {
                     let hash = 0;
                     for (let i = 0; i < msg.length; i++) hash = ((hash << 5) - hash) + msg.charCodeAt(i);
-                    return Math.abs(hash).toString(16).padStart(8, '0') + "fallback";
+                    return (Math.abs(hash).toString(16).padStart(8, '0') + "f11").toLowerCase();
                 }
             }
 
             async function generateFolderId(files, folderName) {
-                let salt = localStorage.getItem('copypaste_salt') || Math.random().toString(36).substring(2);
-                const msg = salt + folderName + files.length + (files[0] ? files[0].size : 0); 
+                let msg = folderName + files.length;
+                for(let i=0; i<Math.min(files.length, 5); i++) msg += files[i].name + files[i].size;
                 
                 if (window.crypto && crypto.subtle) {
                     const buffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(msg));
@@ -636,7 +650,7 @@ app.get('/', (req, res) => {
                 } else {
                     let hash = 0;
                     for (let i = 0; i < msg.length; i++) hash = ((hash << 5) - hash) + msg.charCodeAt(i);
-                    return Math.abs(hash).toString(16).padStart(8, '0') + "folder";
+                    return (Math.abs(hash).toString(16).padStart(8, '0') + "f1d").toLowerCase();
                 }
             }
 
@@ -645,11 +659,30 @@ app.get('/', (req, res) => {
                 ['btn-files', 'btn-folder', 'btn-text'].forEach(id => document.getElementById(id).disabled = isUploading);
             }
 
+            // Met à jour la liste des "En cours" pour bloquer visuellement le bouton Supprimer
+            function updateGhostUI() {
+                document.querySelectorAll('.ghost-item').forEach(el => {
+                    const filename = el.id.replace('ghost-', '');
+                    const fileId = filename.split('.')[0];
+                    const btn = el.querySelector('.btn-delete');
+                    if (btn) {
+                        if (activeUploads.includes(fileId)) {
+                            btn.disabled = true;
+                            btn.innerText = 'En cours...';
+                            btn.style.background = 'var(--gray)';
+                        } else {
+                            btn.disabled = false;
+                            btn.innerText = 'Supprimer';
+                            btn.style.background = 'var(--red)';
+                        }
+                    }
+                });
+            }
+
             function updateProgress(totalUploaded, totalBytes, startTime, alreadyOnServerBytes = 0) {
                 const percent = Math.round((totalUploaded / totalBytes) * 100) || 0;
                 const elapsedSeconds = (Date.now() - startTime) / 1000;
                 
-                // Vitesse basee uniquement sur ce qui est reellement envoye via le reseau
                 const transmittedBytes = totalUploaded - alreadyOnServerBytes;
                 const speedMb = elapsedSeconds > 0 ? (transmittedBytes / 1048576) / elapsedSeconds : 0;
                 const remainingMb = (totalBytes - totalUploaded) / 1048576;
@@ -668,7 +701,7 @@ app.get('/', (req, res) => {
                 const globalTokens = JSON.parse(localStorage.getItem('copypaste_tokens') || '{}');
 
                 setUIUploading(true);
-                document.getElementById('progress-text').innerText = 'Verification des fichiers sur le serveur...';
+                document.getElementById('progress-text').innerText = 'Vérification des fichiers sur le serveur...';
                 activeUploads = [];
 
                 let folderId = null;
@@ -678,7 +711,6 @@ app.get('/', (req, res) => {
                     folderId = await generateFolderId(files, folderName);
                 }
 
-                // 1. Preparation : On demande au serveur ou en est chaque fichier
                 const fileUploadStates = new Array(files.length).fill(0);
                 let bytesAlreadyOnServer = 0;
                 
@@ -700,13 +732,13 @@ app.get('/', (req, res) => {
                 const startTime = Date.now();
 
                 try {
-                    // 2. Upload des fichiers
                     for (let i = 0; i < files.length; i++) {
                         const file = files[i];
                         const fileId = await generateFileId(file);
                         
-                        if (fileUploadStates[i] < file.size) {
+                        if (fileUploadStates[i] < file.size || file.size === 0) {
                             activeUploads.push(fileId);
+                            updateGhostUI(); // Sécurise immédiatement le bouton si le fantôme est affiché
                             
                             const data = await uploadSingleFile(file, duration, folderId, isFolder, fileId, fileUploadStates[i], (newFileBytes) => {
                                 fileUploadStates[i] = newFileBytes;
@@ -714,15 +746,16 @@ app.get('/', (req, res) => {
                                 updateProgress(totalNow, totalBytes, startTime, bytesAlreadyOnServer);
                             });
                             
+                            activeUploads = activeUploads.filter(id => id !== fileId);
+                            updateGhostUI();
+
                             if (!isFolder && data && data.tokens) data.tokens.forEach(t => globalTokens[t.id] = t.token);
                         } else {
-                            // Fichier deja totalement uploade lors d'une session precedente
                             const totalNow = fileUploadStates.reduce((a, b) => a + b, 0);
                             updateProgress(totalNow, totalBytes, startTime, bytesAlreadyOnServer);
                         }
                     }
                     
-                    // 3. Finalisation du dossier (Zipping)
                     if (isFolder) {
                         document.getElementById('progress-text').innerText = 'Compression du dossier ZIP sur le serveur...';
                         const res = await fetch('/finalize-folder', {
@@ -740,7 +773,7 @@ app.get('/', (req, res) => {
                     window.location.reload();
                 } catch (err) {
                     if (err.message === 'RESTART_NEEDED') {
-                        alert("Le fichier residuel a ete altere. L'envoi a ete stoppe pour eviter la corruption. Veuillez reessayer.");
+                        alert("Le fichier résiduel a été altéré sur le serveur. L'envoi a été stoppé. Veuillez réessayer.");
                     } else {
                         alert("Erreur: " + err.message);
                     }
@@ -752,14 +785,14 @@ app.get('/', (req, res) => {
             async function uploadSingleFile(file, duration, folderId, isFolder, fileId, startingOffset, onProgress) {
                 let uploadedBytesChunks = startingOffset;
 
-                while (uploadedBytesChunks < file.size) {
+                while (uploadedBytesChunks < file.size || file.size === 0) {
                     const end = Math.min(uploadedBytesChunks + CHUNK_SIZE, file.size);
-                    const chunk = file.slice(uploadedBytesChunks, end);
+                    const chunk = file.size === 0 ? new Blob([]) : file.slice(uploadedBytesChunks, end);
 
                     const formData = new FormData();
                     formData.append('chunk', chunk);
                     formData.append('fileId', fileId);
-                    formData.append('offset', uploadedBytesChunks); // Le client indique ou il commence
+                    formData.append('offset', uploadedBytesChunks); 
                     formData.append('totalSize', file.size);
                     formData.append('filename', file.name);
                     formData.append('duration', duration);
@@ -780,9 +813,9 @@ app.get('/', (req, res) => {
                             if (xhr.status === 200) {
                                 resolve(JSON.parse(xhr.responseText));
                             } else if (xhr.status === 409) {
-                                reject(new Error('RESTART_NEEDED')); // Erreur specifique si le fichier a ete supprime pendant la pause
+                                reject(new Error('RESTART_NEEDED')); 
                             } else {
-                                reject(new Error(xhr.responseText || 'Erreur reseau'));
+                                reject(new Error(xhr.responseText || 'Erreur réseau'));
                             }
                         };
                         xhr.onerror = () => reject(new Error('Serveur inaccessible'));
@@ -793,6 +826,7 @@ app.get('/', (req, res) => {
                     if (onProgress) onProgress(uploadedBytesChunks);
                     
                     if (response.complete || response.status === 'done') return response;
+                    if (file.size === 0) break; // Sortie forcée pour les fichiers vides
                 }
                 return null;
             }
@@ -859,7 +893,7 @@ app.get('/', (req, res) => {
                             }
                             if (data.type === 'delete-ghost' && document.querySelectorAll('.ghost-item').length === 0) {
                                 const ghostList = document.getElementById('ghost-list');
-                                if(!document.getElementById('ghost-empty-msg')) ghostList.innerHTML = '<p class="empty" id="ghost-empty-msg">Aucun fichier residuel.</p>';
+                                if(!document.getElementById('ghost-empty-msg')) ghostList.innerHTML = '<p class="empty" id="ghost-empty-msg">Aucun fichier résiduel.</p>';
                             }
                         }, 300);
                     }
@@ -915,15 +949,15 @@ app.use((err, req, res, next) => {
         req.multerTempFiles = [];
     }
     if (err instanceof multer.MulterError) {
-        if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).send("Un fichier depasse la limite autorisee.");
+        if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).send("Un fichier dépasse la limite autorisée.");
         if (err.code === 'LIMIT_FIELD_SIZE') return res.status(413).send("Le texte est trop long.");
         return res.status(400).send(`Erreur d'upload : ${err.message}`);
     } else if (err) {
-        return res.status(500).send("Erreur serveur : Le transfert a ete interrompu.");
+        return res.status(500).send("Erreur serveur : Le transfert a été interrompu.");
     }
     next();
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Serveur CopyPaste demarre sur http://localhost:${PORT}`);
+    console.log(`Serveur CopyPaste démarré sur http://localhost:${PORT}`);
 });

@@ -4,114 +4,58 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const archiver = require('archiver');
+const { pipeline } = require('stream/promises');
 
 const app = express();
 const PORT = 3000;
 const UPLOAD_DIR = path.join(__dirname, 'temp_uploads');
 
-// Nettoyage asynchrone au démarrage
+// Nettoyage au démarrage
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
-try { fs.readdirSync(UPLOAD_DIR).forEach(f => fs.unlinkSync(path.join(UPLOAD_DIR, f))); } catch (err) {}
+try { fs.rmSync(UPLOAD_DIR, { recursive: true, force: true }); fs.mkdirSync(UPLOAD_DIR); } catch (err) {}
 
-// === LIMITES STRICTES PROXMOX (512Mo RAM, 1 Core) ===
-const MAX_STORAGE_BYTES = 15 * 1024 * 1024 * 1024; // 15 Go (Limite globale du serveur)
+// === LIMITES STRICTES ===
+const MAX_STORAGE_BYTES = 15 * 1024 * 1024 * 1024; // 15 Go
 const MAX_GLOBAL_FILES = 5000; 
-const MAX_FILE_SIZE = 14 * 1024 * 1024 * 1024; // 14 Go max par fichier individuel
-const MAX_TEXT_SIZE = 2 * 1024 * 1024; // 2 Mo max pour le texte
-const ABSOLUTE_TIMEOUT_MS = 60 * 60 * 1000; 
+const ABSOLUTE_TIMEOUT_MS = 60 * 60 * 1000; // 1h
 const MAX_SSE_CLIENTS = 100; 
 
 let currentTotalSize = 0;
 let currentTotalFiles = 0;
-let reservedSize = 0;
 const storedItems = new Map();
 const connectedClients = new Set();
 
-// SÉCURITÉ : Traceur de fichiers temporaires pour nettoyage chirurgical
+// Multer gère uniquement la réception des morceaux de 50 Mo
 const storage = multer.diskStorage({
     destination: UPLOAD_DIR,
     filename: (req, file, cb) => {
-        const uniqueId = crypto.randomBytes(8).toString('hex');
-        const safeName = path.basename(file.originalname);
-        const fullFilename = `${uniqueId}-${safeName}`;
-        
-        if (!req.multerTempFiles) req.multerTempFiles = [];
-        req.multerTempFiles.push(path.join(UPLOAD_DIR, fullFilename));
-        
-        cb(null, fullFilename);
+        cb(null, `chunk-${crypto.randomBytes(8).toString('hex')}.tmp`);
     }
 });
 
 const upload = multer({ 
     storage: storage,
-    limits: { 
-        fileSize: MAX_FILE_SIZE, 
-        fieldSize: MAX_TEXT_SIZE, 
-        files: 500,
-        fields: 10 
-    }
+    limits: { fileSize: 60 * 1024 * 1024, files: 1 } // Accepte un chunk jusqu'à 60Mo (marge de sécurité)
 });
 
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 app.use(express.json({ limit: '100kb' }));
 
 function escapeHtml(unsafe) {
-    return (unsafe || '').toString()
-         .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-         .replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+    return (unsafe || '').toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
 }
 
-function safeUnlink(filePath, retries = 3) {
-    if (!filePath) return;
-    fs.unlink(filePath, (err) => {
-        if (err && err.code === 'EBUSY' && retries > 0) {
-            setTimeout(() => safeUnlink(filePath, retries - 1), 10000);
-        }
-    });
+function sanitizeRelativePath(unsafePath) {
+    let clean = unsafePath.replace(/\0/g, '').replace(/\\/g, '/');
+    clean = path.normalize(clean);
+    if (clean.startsWith('..') || clean.startsWith('/')) return path.basename(clean); 
+    return clean;
 }
 
-app.use((req, res, next) => {
-    if (req.method === 'POST' && req.path.startsWith('/upload')) {
-        const contentLengthHeader = req.headers['content-length'];
-        if (!contentLengthHeader) return res.status(411).send("Code 411 : 'Content-Length' requis.");
-
-        const contentLength = Math.max(0, parseInt(contentLengthHeader, 10) || 0);
-        
-        if (currentTotalSize + reservedSize + contentLength > MAX_STORAGE_BYTES) {
-            return res.status(413).send("La limite de 15 Go est atteinte ou l'espace est temporairement réservé.");
-        }
-        if (currentTotalFiles >= MAX_GLOBAL_FILES) {
-            return res.status(503).send("Quota maximum de fichiers simultanés atteint.");
-        }
-        
-        req.reservedBytes = contentLength;
-        reservedSize += contentLength;
-
-        let actualBytesReceived = 0;
-        req.on('data', (chunk) => {
-            actualBytesReceived += chunk.length;
-            if (actualBytesReceived > contentLength + 2048) { 
-                req.destroy(); 
-            }
-        });
-
-        req.reservationReleased = false;
-        const cleanupRequest = () => {
-            if (!req.reservationReleased) {
-                reservedSize = Math.max(0, reservedSize - req.reservedBytes);
-                req.reservationReleased = true;
-            }
-            if (!res.writableEnded && req.multerTempFiles) {
-                req.multerTempFiles.forEach(f => safeUnlink(f));
-                req.multerTempFiles = [];
-            }
-        };
-
-        res.on('finish', cleanupRequest);
-        res.on('close', cleanupRequest);
-    }
-    next();
-});
+function safeUnlink(filePath) {
+    if (!filePath || !fs.existsSync(filePath)) return;
+    fs.unlink(filePath, () => {});
+}
 
 app.get('/events', (req, res) => {
     if (connectedClients.size >= MAX_SSE_CLIENTS) return res.status(503).end();
@@ -122,15 +66,10 @@ app.get('/events', (req, res) => {
 
     connectedClients.add(res);
     const heartbeat = setInterval(() => res.write(':\n\n'), 20000);
-
-    req.on('close', () => {
-        clearInterval(heartbeat);
-        connectedClients.delete(res);
-    });
+    req.on('close', () => { clearInterval(heartbeat); connectedClients.delete(res); });
 });
 
-// CORRECTION : Envoi de la nouvelle taille via SSE
-function broadcastDelete(id) {
+function broadcastState(id) {
     const message = `data: ${JSON.stringify({ type: 'delete', id: id, newSize: currentTotalSize })}\n\n`;
     for (const client of connectedClients) client.write(message);
 }
@@ -172,22 +111,16 @@ function deleteItemData(id) {
         clearTimeout(item.timeoutId);
         clearTimeout(item.absoluteTimeoutId);
         storedItems.delete(id);
-        
-        // CORRECTION : On met à jour l'espace et les fichiers en mémoire vive instantanément
         currentTotalSize = Math.max(0, currentTotalSize - item.size);
         currentTotalFiles = Math.max(0, currentTotalFiles - 1);
-        
         safeUnlink(item.path);
-        broadcastDelete(id);
+        broadcastState(id);
     }
 }
 
 function getPreviewHtml(item) {
     if (item.isText) {
-        return `
-            <div class="preview-box text-content">${item.previewText}</div>
-            <button class="btn-copy" onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copié !'; setTimeout(()=>this.innerText='Copier', 2000)">Copier</button>
-        `;
+        return `<div class="preview-box text-content">${item.previewText}</div><button class="btn-copy" onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copié !'; setTimeout(()=>this.innerText='Copier', 2000)">Copier</button>`;
     }
     const ext = path.extname(item.originalName).toLowerCase();
     if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) return `<img class="preview-media" src="/view/${item.id}" loading="lazy" alt="Aperçu">`;
@@ -197,29 +130,200 @@ function getPreviewHtml(item) {
     return `<div class="preview-box">Aperçu indisponible</div>`;
 }
 
+// Auto-Healer Asynchrone : Traque les morceaux abandonnés (Dossiers et .part)
 setInterval(async () => {
     try {
-        let actualPhysicalSize = 0;
-        let actualFileCount = 0;
-        const activePaths = new Set(Array.from(storedItems.values()).map(i => path.basename(i.path)));
-        
-        const filesOnDisk = await fs.promises.readdir(UPLOAD_DIR);
+        let actualSize = 0;
+        let actualFiles = 0;
+        const activeIds = new Set(Array.from(storedItems.values()).map(i => i.id));
+        const entries = await fs.promises.readdir(UPLOAD_DIR, { withFileTypes: true });
 
-        for (const file of filesOnDisk) {
-            const filePath = path.join(UPLOAD_DIR, file);
-            const stats = await fs.promises.stat(filePath);
+        for (const dirent of entries) {
+            const fullPath = path.join(UPLOAD_DIR, dirent.name);
+            const stats = await fs.promises.stat(fullPath);
+            const isAbandoned = (Date.now() - stats.mtimeMs) > ABSOLUTE_TIMEOUT_MS;
 
-            if (!activePaths.has(file) && (Date.now() - stats.mtimeMs > ABSOLUTE_TIMEOUT_MS)) {
-                safeUnlink(filePath);
+            if (dirent.isDirectory()) {
+                if (isAbandoned) fs.rm(fullPath, { recursive: true, force: true }, () => {});
             } else {
-                actualPhysicalSize += stats.size;
-                actualFileCount++;
+                if ((dirent.name.endsWith('.part') || dirent.name.endsWith('.tmp')) && isAbandoned) {
+                    safeUnlink(fullPath);
+                } else if (!dirent.name.endsWith('.part') && !dirent.name.endsWith('.tmp')) {
+                    const id = dirent.name.split('-')[0];
+                    if (!activeIds.has(id) && isAbandoned) safeUnlink(fullPath);
+                    else if (activeIds.has(id)) { actualSize += stats.size; actualFiles++; }
+                }
             }
         }
-        currentTotalSize = actualPhysicalSize;
-        currentTotalFiles = actualFileCount;
+        currentTotalSize = actualSize;
+        currentTotalFiles = actualFiles;
     } catch (err) {}
 }, 15 * 60 * 1000);
+
+// --- NOUVEAU MOTEUR DE RÉCEPTION DES MORCEAUX (CHUNKS) ---
+
+app.post('/upload-chunk', upload.single('chunk'), async (req, res) => {
+    if (!req.file) return res.status(400).send("Morceau manquant.");
+    
+    try {
+        const { fileId, chunkIndex, totalChunks, filename, duration, folderId, relativePath } = req.body;
+        
+        // SÉCURITÉ : Validation stricte des IDs pour éviter l'injection de chemin
+        if (!/^[a-f0-9]{16}$/.test(fileId)) throw new Error("ID de fichier invalide.");
+        if (folderId && !/^[a-f0-9]{16}$/.test(folderId)) throw new Error("ID de dossier invalide.");
+
+        const chunkSize = req.file.size;
+        if (currentTotalSize + chunkSize > MAX_STORAGE_BYTES) throw new Error("Limite de 15 Go dépassée.");
+        if (currentTotalFiles >= MAX_GLOBAL_FILES) throw new Error("Quota de fichiers atteint.");
+
+        // On colle le morceau à la fin du fichier partiel
+        const partPath = path.join(UPLOAD_DIR, `${fileId}.part`);
+        await pipeline(fs.createReadStream(req.file.path), fs.createWriteStream(partPath, { flags: 'a' }));
+        safeUnlink(req.file.path);
+        
+        currentTotalSize += chunkSize;
+
+        // Si c'est le dernier morceau du fichier
+        if (parseInt(chunkIndex) === parseInt(totalChunks) - 1) {
+            const delayMs = (parseInt(duration) || 5) * 60 * 1000;
+            const safeName = sanitizeRelativePath(filename);
+
+            if (folderId) {
+                // Le fichier appartient à un dossier
+                const folderPath = path.join(UPLOAD_DIR, folderId);
+                if (!fs.existsSync(folderPath)) fs.mkdirSync(folderPath, { recursive: true });
+                
+                const finalSubPath = path.join(folderPath, sanitizeRelativePath(relativePath || filename));
+                fs.mkdirSync(path.dirname(finalSubPath), { recursive: true });
+                fs.renameSync(partPath, finalSubPath);
+                
+                return res.json({ status: 'chunk_ok', complete: true });
+            } else {
+                // C'est un fichier seul, on finalise son upload
+                const finalId = crypto.randomBytes(8).toString('hex');
+                const finalPath = path.join(UPLOAD_DIR, `${finalId}-${safeName}`);
+                fs.renameSync(partPath, finalPath);
+                
+                currentTotalFiles++;
+                const deleteToken = crypto.randomBytes(16).toString('hex');
+                
+                storedItems.set(finalId, {
+                    id: finalId, originalName: filename, path: finalPath, size: fs.statSync(finalPath).size,
+                    isText: false, activeDownloads: 0, deleteToken
+                });
+                scheduleDestruction(finalId, delayMs);
+                return res.json({ status: 'done', tokens: [{ id: finalId, token: deleteToken }] });
+            }
+        }
+
+        res.json({ status: 'chunk_ok', complete: false });
+    } catch (err) {
+        if (req.file) safeUnlink(req.file.path);
+        res.status(400).send(err.message);
+    }
+});
+
+// Finalisation d'un dossier uploadé
+app.post('/finalize-folder', async (req, res) => {
+    const { folderId, duration, folderName } = req.body;
+    if (!/^[a-f0-9]{16}$/.test(folderId)) return res.status(400).send("ID invalide.");
+
+    const folderPath = path.join(UPLOAD_DIR, folderId);
+    if (!fs.existsSync(folderPath)) return res.status(404).send("Dossier introuvable.");
+
+    const delayMs = (parseInt(duration) || 5) * 60 * 1000;
+    const safeZipName = sanitizeRelativePath(folderName || 'Dossier') + '.zip';
+    const finalId = crypto.randomBytes(8).toString('hex');
+    const zipPath = path.join(UPLOAD_DIR, `${finalId}-${safeZipName}`);
+
+    const output = fs.createWriteStream(zipPath);
+    const archive = archiver('zip', { zlib: { level: 0 } }); // Niveau 0 vital pour Proxmox 512Mo
+
+    output.on('close', () => {
+        const zipSize = archive.pointer();
+        fs.rm(folderPath, { recursive: true, force: true }, () => {}); // On supprime le dossier source pour libérer l'espace
+        
+        currentTotalFiles++;
+        const deleteToken = crypto.randomBytes(16).toString('hex');
+        
+        storedItems.set(finalId, {
+            id: finalId, originalName: safeZipName, path: zipPath, size: zipSize,
+            isText: false, activeDownloads: 0, deleteToken
+        });
+        scheduleDestruction(finalId, delayMs);
+        res.json({ tokens: [{ id: finalId, token: deleteToken }] });
+    });
+
+    archive.on('error', (err) => {
+        safeUnlink(zipPath);
+        fs.rm(folderPath, { recursive: true, force: true }, () => {});
+        res.status(500).send(err.message);
+    });
+
+    archive.pipe(output);
+    archive.directory(folderPath, false); // Zippe tout le contenu en préservant l'arborescence
+    archive.finalize();
+});
+
+app.post('/upload-text', multer().none(), (req, res) => {
+    if (!req.body || typeof req.body.text !== 'string' || req.body.text.trim() === '') return res.status(400).send('Texte vide.');
+    
+    const buffer = Buffer.from(req.body.text, 'utf-8');
+    if (currentTotalSize + buffer.length > MAX_STORAGE_BYTES) return res.status(413).send('Limite de 15 Go dépassée.');
+    
+    const delayMs = (parseInt(req.body.duration) || 5) * 60 * 1000;
+    const finalId = crypto.randomBytes(8).toString('hex');
+    const filePath = path.join(UPLOAD_DIR, `${finalId}-texte.txt`);
+
+    fs.writeFileSync(filePath, buffer);
+    currentTotalSize += buffer.length;
+    currentTotalFiles++;
+    
+    const deleteToken = crypto.randomBytes(16).toString('hex');
+    const safePreview = escapeHtml(buffer.toString('utf8', 0, Math.min(buffer.length, 2000))) + (buffer.length > 2000 ? '\n\n[...]' : '');
+
+    storedItems.set(finalId, {
+        id: finalId, originalName: 'Texte collé', path: filePath, size: buffer.length,
+        isText: true, activeDownloads: 0, deleteToken, previewText: safePreview
+    });
+    scheduleDestruction(finalId, delayMs);
+    res.json({ tokens: [{ id: finalId, token: deleteToken }] });
+});
+
+app.post('/delete/:id', (req, res) => {
+    const item = storedItems.get(req.params.id);
+    if (!item) return res.status(404).send('Inconnu');
+
+    let clientTokenStr = req.body.token || '';
+    if (typeof clientTokenStr !== 'string' || !/^[0-9a-f]{32}$/.test(clientTokenStr)) return res.status(403).send('Jeton invalide.');
+
+    const tokenA = Buffer.from(item.deleteToken, 'hex');
+    const tokenB = Buffer.from(clientTokenStr, 'hex');
+
+    if (tokenA.length === tokenB.length && crypto.timingSafeEqual(tokenA, tokenB)) {
+        deleteItemData(req.params.id);
+        res.sendStatus(200);
+    } else {
+        res.status(403).send('Non autorisé ou expiré.');
+    }
+});
+
+app.get('/view/:id', (req, res) => {
+    const item = storedItems.get(req.params.id);
+    if (!item) return res.status(404).end();
+    res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'");
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.sendFile(item.path);
+});
+
+app.get('/download/:id', (req, res) => {
+    const item = storedItems.get(req.params.id);
+    if (!item) return res.status(404).send('Expiré.');
+    pauseTimer(item.id);
+    res.download(item.path, item.originalName, () => resumeTimer(item.id));
+});
+
+// --- INTERFACE WEB (FRONTEND AVEC DÉCOUPAGE CHUNK) ---
 
 app.get('/', (req, res) => {
     const itemsHtml = Array.from(storedItems.values()).sort((a, b) => a.expiresAt - b.expiresAt).map(item => `
@@ -244,7 +348,7 @@ app.get('/', (req, res) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>CopyPaste (non chiffré)</title>
+        <title>CopyPaste</title>
         <style>
             :root { --bg: #ffffff; --text: #000000; --gray: #888888; --light-gray: #f5f5f5; --border: #eeeeee; --red: #d93025; }
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 600px; margin: 2rem auto; padding: 0 1rem; color: var(--text); background: var(--bg); line-height: 1.5; }
@@ -259,6 +363,7 @@ app.get('/', (req, res) => {
             textarea { height: 60px; resize: vertical; }
             button, .btn-download { background: var(--text); color: var(--bg); border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; text-decoration: none; font-size: 0.9rem; font-weight: 500; display: inline-block; }
             button:hover, .btn-download:hover { opacity: 0.8; }
+            button:disabled { opacity: 0.5; cursor: not-allowed; }
             .btn-copy { background: var(--light-gray); color: var(--text); border: 1px solid var(--border); margin-top: 0.5rem; }
             .btn-delete { background: var(--red); color: white; padding: 0.2rem 0.6rem; margin-left: 0.5rem; font-size: 0.8rem; }
             ul { list-style: none; padding: 0; margin: 0; }
@@ -283,12 +388,11 @@ app.get('/', (req, res) => {
         </style>
     </head>
     <body>
-        <!-- CORRECTION : Ajout de l'ID storage-info pour la mise à jour en direct -->
-        <h1><span>CopyPaste (non chiffré)</span> <span class="storage-info" id="storage-info">${(currentTotalSize / (1024 ** 3)).toFixed(2)} / 15 Go</span></h1>
+        <h1><span>CopyPaste</span> <span class="storage-info" id="storage-info">${(currentTotalSize / (1024 ** 3)).toFixed(2)} / 15 Go</span></h1>
 
         <div class="settings">
-            <div>Autodestruction : <input type="number" id="duration" min="1" max="15" value="5"> min</div>
-            <button class="btn-refresh" onclick="window.location.reload()">Rafraîchir</button>
+            <div>⏳ Autodestruction : <input type="number" id="duration" min="1" max="15" value="5"> min</div>
+            <button class="btn-refresh" onclick="window.location.reload()">🔄 Rafraîchir</button>
         </div>
 
         <div id="progress-wrapper">
@@ -297,24 +401,18 @@ app.get('/', (req, res) => {
         </div>
 
         <div class="section">
-            <form action="/upload-files" method="POST" class="upload-form" autocomplete="off">
-                <div class="input-group">
-                    <input type="file" name="files" multiple required title="Sélectionner des fichiers">
-                    <button type="submit">Fichiers</button>
-                </div>
-            </form>
-            <form action="/upload-folder" method="POST" class="upload-form" autocomplete="off">
-                <div class="input-group">
-                    <input type="file" name="files" webkitdirectory directory multiple required title="Sélectionner un dossier">
-                    <button type="submit">Dossier (ZIP)</button>
-                </div>
-            </form>
-            <form action="/upload-text" method="POST" class="upload-form" autocomplete="off">
-                <div class="input-group" style="align-items: flex-start;">
-                    <textarea name="text" placeholder="Coller du texte..." required></textarea>
-                    <button type="submit" style="height: 60px;">Texte</button>
-                </div>
-            </form>
+            <div class="input-group">
+                <input type="file" id="input-files" multiple title="Sélectionner des fichiers">
+                <button id="btn-files" onclick="startChunkedUpload(false)">Fichiers</button>
+            </div>
+            <div class="input-group">
+                <input type="file" id="input-folder" webkitdirectory directory multiple title="Sélectionner un dossier">
+                <button id="btn-folder" onclick="startChunkedUpload(true)">Dossier (ZIP)</button>
+            </div>
+            <div class="input-group" style="align-items: flex-start;">
+                <textarea id="input-text" placeholder="Coller du texte..."></textarea>
+                <button id="btn-text" onclick="uploadText()" style="height: 60px;">Texte</button>
+            </div>
         </div>
 
         <ul id="list">
@@ -322,8 +420,140 @@ app.get('/', (req, res) => {
         </ul>
 
         <script>
+            // --- GESTION DU CHUNKING CÔTÉ CLIENT (CONTOURNEMENT CLOUDFLARE) ---
+            const CHUNK_SIZE = 50 * 1024 * 1024; // Morceaux de 50 Mo
+
+            function generateUUID() {
+                return Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2, '0')).join('');
+            }
+
+            function setUIUploading(isUploading) {
+                document.getElementById('progress-wrapper').style.display = isUploading ? 'block' : 'none';
+                ['btn-files', 'btn-folder', 'btn-text'].forEach(id => document.getElementById(id).disabled = isUploading);
+            }
+
+            function updateProgress(uploadedBytes, totalBytes, startTime) {
+                const percent = Math.round((uploadedBytes / totalBytes) * 100) || 0;
+                const elapsedSeconds = (Date.now() - startTime) / 1000;
+                const speedMb = elapsedSeconds > 0 ? (uploadedBytes / 1048576) / elapsedSeconds : 0;
+                const remainingMb = (totalBytes - uploadedBytes) / 1048576;
+
+                document.getElementById('progress-bar').style.width = percent + '%';
+                document.getElementById('progress-text').innerText = \`\${percent}% | \${(uploadedBytes/1048576).toFixed(2)} / \${(totalBytes/1048576).toFixed(2)} Mo | \${speedMb.toFixed(2)} Mo/s | Reste : \${remainingMb.toFixed(2)} Mo\`;
+            }
+
+            async function startChunkedUpload(isFolder) {
+                const input = isFolder ? document.getElementById('input-folder') : document.getElementById('input-files');
+                const files = input.files;
+                if (!files || files.length === 0) return;
+
+                const duration = document.getElementById('duration').value;
+                const totalBytes = Array.from(files).reduce((sum, f) => sum + f.size, 0);
+                let uploadedBytes = 0;
+                const startTime = Date.now();
+                const globalTokens = JSON.parse(localStorage.getItem('copypaste_tokens') || '{}');
+
+                setUIUploading(true);
+
+                try {
+                    if (isFolder) {
+                        const folderId = generateUUID();
+                        let folderName = files[0].webkitRelativePath.split('/')[0] || 'Dossier';
+                        
+                        for (const file of files) {
+                            await uploadSingleFile(file, duration, folderId, isFolder);
+                            uploadedBytes += file.size;
+                            updateProgress(uploadedBytes, totalBytes, startTime);
+                        }
+                        
+                        document.getElementById('progress-text').innerText = 'Compression du dossier ZIP sur le serveur...';
+                        const res = await fetch('/finalize-folder', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ folderId, duration, folderName })
+                        });
+                        if (!res.ok) throw new Error(await res.text());
+                        
+                        const data = await res.json();
+                        data.tokens.forEach(t => globalTokens[t.id] = t.token);
+
+                    } else {
+                        for (const file of files) {
+                            const data = await uploadSingleFile(file, duration, null, false);
+                            if (data && data.tokens) data.tokens.forEach(t => globalTokens[t.id] = t.token);
+                            uploadedBytes += file.size;
+                            updateProgress(uploadedBytes, totalBytes, startTime);
+                        }
+                    }
+
+                    localStorage.setItem('copypaste_tokens', JSON.stringify(globalTokens));
+                    window.location.reload();
+                } catch (err) {
+                    alert("Erreur: " + err.message);
+                    setUIUploading(false);
+                }
+            }
+
+            async function uploadSingleFile(file, duration, folderId, isFolder) {
+                const fileId = generateUUID();
+                const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+                let lastResponseData = null;
+
+                for (let i = 0; i < totalChunks; i++) {
+                    const start = i * CHUNK_SIZE;
+                    const end = Math.min(start + CHUNK_SIZE, file.size);
+                    const chunk = file.slice(start, end);
+
+                    const formData = new FormData();
+                    formData.append('chunk', chunk);
+                    formData.append('fileId', fileId);
+                    formData.append('chunkIndex', i);
+                    formData.append('totalChunks', totalChunks);
+                    formData.append('filename', file.name);
+                    formData.append('duration', duration);
+                    if (isFolder) {
+                        formData.append('folderId', folderId);
+                        formData.append('relativePath', file.webkitRelativePath || file.name);
+                    }
+
+                    const res = await fetch('/upload-chunk', { method: 'POST', body: formData });
+                    if (!res.ok) throw new Error(await res.text());
+                    lastResponseData = await res.json();
+                }
+                return lastResponseData;
+            }
+
+            async function uploadText() {
+                const text = document.getElementById('input-text').value;
+                if (!text.trim()) return;
+
+                setUIUploading(true);
+                document.getElementById('progress-text').innerText = 'Envoi du texte...';
+
+                const fd = new FormData();
+                fd.append('text', text);
+                fd.append('duration', document.getElementById('duration').value);
+
+                try {
+                    const res = await fetch('/upload-text', { method: 'POST', body: fd });
+                    if (!res.ok) throw new Error(await res.text());
+                    const data = await res.json();
+                    
+                    const tokens = JSON.parse(localStorage.getItem('copypaste_tokens') || '{}');
+                    data.tokens.forEach(t => tokens[t.id] = t.token);
+                    localStorage.setItem('copypaste_tokens', JSON.stringify(tokens));
+                    window.location.reload();
+                } catch (err) {
+                    alert("Erreur: " + err.message);
+                    setUIUploading(false);
+                }
+            }
+
+            // --- GESTION DU RESTE DE L'UI ---
             window.addEventListener('DOMContentLoaded', () => {
-                document.querySelectorAll('.upload-form').forEach(form => form.reset());
+                document.getElementById('input-files').value = "";
+                document.getElementById('input-folder').value = "";
+                document.getElementById('input-text').value = "";
             });
 
             const eventSource = new EventSource('/events');
@@ -338,19 +568,13 @@ app.get('/', (req, res) => {
                             el.remove();
                             if (document.querySelectorAll('.item').length === 0) {
                                 const list = document.getElementById('list');
-                                if(!document.getElementById('empty-msg')) {
-                                    list.innerHTML = '<p class="empty" id="empty-msg">Aucun fichier pour le moment.</p>';
-                                }
+                                if(!document.getElementById('empty-msg')) list.innerHTML = '<p class="empty" id="empty-msg">Aucun fichier pour le moment.</p>';
                             }
                         }, 300);
                     }
-                    
-                    // CORRECTION : Mise à jour de la jauge en haut de page en temps réel
                     if (data.newSize !== undefined) {
                         const storageEl = document.getElementById('storage-info');
-                        if (storageEl) {
-                            storageEl.innerText = (data.newSize / (1024 ** 3)).toFixed(2) + ' / 15 Go';
-                        }
+                        if (storageEl) storageEl.innerText = (data.newSize / (1024 ** 3)).toFixed(2) + ' / 15 Go';
                     }
                 }
             };
@@ -364,9 +588,7 @@ app.get('/', (req, res) => {
                     btn.className = 'btn-delete';
                     btn.onclick = () => {
                         fetch('/delete/' + id, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ token: tokens[id] })
+                            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: tokens[id] })
                         }).then(() => {
                             delete tokens[id];
                             localStorage.setItem('copypaste_tokens', JSON.stringify(tokens));
@@ -374,63 +596,6 @@ app.get('/', (req, res) => {
                     };
                     el.querySelector('.item-actions').appendChild(btn);
                 }
-            });
-
-            document.querySelectorAll('.upload-form').forEach(form => {
-                form.addEventListener('submit', function(e) {
-                    e.preventDefault();
-                    const formData = new FormData(this);
-                    formData.append('duration', document.getElementById('duration').value);
-
-                    const xhr = new XMLHttpRequest();
-                    xhr.open('POST', this.action, true);
-                    
-                    const wrapper = document.getElementById('progress-wrapper');
-                    const bar = document.getElementById('progress-bar');
-                    const text = document.getElementById('progress-text');
-                    const submitButtons = document.querySelectorAll('button[type="submit"]');
-                    
-                    wrapper.style.display = 'block';
-                    submitButtons.forEach(b => b.disabled = true);
-
-                    const startTime = Date.now();
-
-                    xhr.upload.onprogress = function(e) {
-                        if (e.lengthComputable) {
-                            const percent = Math.round((e.loaded / e.total) * 100);
-                            const elapsedSeconds = (Date.now() - startTime) / 1000;
-                            const loadedMb = e.loaded / 1048576;
-                            const totalMb = e.total / 1048576;
-                            const remainingMb = totalMb - loadedMb;
-                            const speedMb = elapsedSeconds > 0 ? loadedMb / elapsedSeconds : 0;
-
-                            bar.style.width = percent + '%';
-                            
-                            if (form.action.includes('folder') && percent === 100) {
-                                text.innerText = 'Compression ZIP en cours... (Veuillez patienter)';
-                            } else {
-                                text.innerText = \`\${percent}% | \${loadedMb.toFixed(2)} / \${totalMb.toFixed(2)} Mo | \${speedMb.toFixed(2)} Mo/s | Reste : \${remainingMb.toFixed(2)} Mo\`;
-                            }
-                        }
-                    };
-
-                    xhr.onload = function() {
-                        if (xhr.status === 200) {
-                            try {
-                                const res = JSON.parse(xhr.responseText);
-                                const currentTokens = JSON.parse(localStorage.getItem('copypaste_tokens') || '{}');
-                                res.tokens.forEach(t => currentTokens[t.id] = t.token);
-                                localStorage.setItem('copypaste_tokens', JSON.stringify(currentTokens));
-                            } catch(err) {}
-                            window.location.reload();
-                        } else {
-                            alert(xhr.responseText || 'Erreur lors de l\\'envoi.');
-                            wrapper.style.display = 'none';
-                            submitButtons.forEach(b => b.disabled = false);
-                        }
-                    };
-                    xhr.send(formData);
-                });
             });
 
             setInterval(() => {
@@ -453,197 +618,8 @@ app.get('/', (req, res) => {
     res.send(html);
 });
 
-function getDelayMs(req) {
-    let durationMin = parseInt(req.body.duration) || 5;
-    if (durationMin < 1) durationMin = 1;
-    if (durationMin > 15) durationMin = 15;
-    return durationMin * 60 * 1000;
-}
-
-function verifyStorageLimitPostUpload(reqFiles) {
-    let incomingSize = 0;
-    reqFiles.forEach(f => incomingSize += f.size);
-    if (currentTotalSize + incomingSize > MAX_STORAGE_BYTES) {
-        reqFiles.forEach(f => safeUnlink(f.path));
-        return false;
-    }
-    return true;
-}
-
-function sanitizeRelativePath(unsafePath) {
-    let clean = unsafePath.replace(/\0/g, '').replace(/\\/g, '/');
-    clean = path.normalize(clean);
-    if (clean.startsWith('..') || clean.startsWith('/')) {
-        return path.basename(clean); 
-    }
-    return clean;
-}
-
-app.post('/upload-files', upload.array('files'), (req, res) => {
-    if (!req.files || req.files.length === 0) return res.status(400).send('Aucun fichier.');
-    
-    const delayMs = getDelayMs(req);
-    const tokens = [];
-
-    req.files.forEach(file => {
-        const id = file.filename;
-        const fileSize = file.size;
-        
-        currentTotalSize += fileSize;
-        currentTotalFiles++;
-        
-        const deleteToken = crypto.randomBytes(16).toString('hex');
-        
-        storedItems.set(id, {
-            id, originalName: file.originalname, path: file.path, size: fileSize,
-            isText: false, activeDownloads: 0, deleteToken
-        });
-        scheduleDestruction(id, delayMs);
-        tokens.push({ id, token: deleteToken });
-    });
-    
-    req.multerTempFiles = [];
-    res.json({ tokens });
-});
-
-app.post('/upload-folder', upload.array('files'), (req, res) => {
-    if (!req.files || req.files.length === 0) return res.status(400).send('Dossier vide.');
-    
-    const delayMs = getDelayMs(req);
-    const id = crypto.randomBytes(8).toString('hex') + '-archive.zip';
-    const zipPath = path.join(UPLOAD_DIR, id);
-    
-    const output = fs.createWriteStream(zipPath);
-    const archive = archiver('zip', { zlib: { level: 0 } }); 
-
-    output.on('close', () => {
-        const fileSize = archive.pointer();
-        currentTotalSize += fileSize;
-        currentTotalFiles++;
-        const deleteToken = crypto.randomBytes(16).toString('hex');
-        
-        storedItems.set(id, {
-            id, originalName: 'Dossier_Archive.zip', path: zipPath, size: fileSize,
-            isText: false, activeDownloads: 0, deleteToken
-        });
-        scheduleDestruction(id, delayMs);
-        
-        req.files.forEach(f => safeUnlink(f.path));
-        req.multerTempFiles = []; 
-        res.json({ tokens: [{ id, token: deleteToken }] });
-    });
-
-    archive.on('error', (err) => {
-        safeUnlink(zipPath);
-        if (!res.headersSent) res.status(500).send(err.message);
-    });
-
-    archive.pipe(output);
-    req.files.forEach(file => {
-        const safePath = sanitizeRelativePath(file.originalname);
-        archive.file(file.path, { name: safePath });
-    });
-    archive.finalize();
-
-    req.on('close', () => {
-        if (!res.writableEnded) {
-            archive.abort();
-            req.files.forEach(f => safeUnlink(f.path));
-            safeUnlink(zipPath);
-        }
-    });
-});
-
-app.post('/upload-text', upload.none(), (req, res) => {
-    if (!req.body || typeof req.body.text !== 'string' || req.body.text.trim() === '') {
-        return res.status(400).send('Texte vide ou invalide.');
-    }
-    const textContent = req.body.text;
-    const delayMs = getDelayMs(req);
-    const id = crypto.randomBytes(8).toString('hex') + '-texte.txt';
-    const filePath = path.join(UPLOAD_DIR, id);
-    const buffer = Buffer.from(textContent, 'utf-8');
-    const fileSize = buffer.length;
-
-    if (currentTotalSize + fileSize > MAX_STORAGE_BYTES) return res.status(413).send('Limite des 15 Go dépassée.');
-    if (currentTotalFiles >= MAX_GLOBAL_FILES) return res.status(503).send("Trop de fichiers.");
-
-    fs.writeFile(filePath, buffer, (err) => {
-        if (err) return res.status(500).send("Erreur de sauvegarde.");
-        currentTotalSize += fileSize;
-        currentTotalFiles++;
-        const deleteToken = crypto.randomBytes(16).toString('hex');
-
-        const previewLimit = 2000;
-        const isTruncated = buffer.length > previewLimit;
-        const previewRaw = buffer.toString('utf8', 0, Math.min(buffer.length, previewLimit));
-        const safePreview = escapeHtml(previewRaw) + (isTruncated ? '\n\n<em style="color:#888;">[... Aperçu tronqué, copiez ou téléchargez pour lire la suite ...]</em>' : '');
-
-        storedItems.set(id, {
-            id, originalName: 'Texte collé', path: filePath, size: fileSize,
-            isText: true, activeDownloads: 0, deleteToken,
-            previewText: safePreview
-        });
-        scheduleDestruction(id, delayMs);
-        res.json({ tokens: [{ id, token: deleteToken }] });
-    });
-});
-
-app.post('/delete/:id', (req, res) => {
-    const item = storedItems.get(req.params.id);
-    if (!item) return res.status(404).send('Inconnu');
-
-    let clientTokenStr = req.body.token || '';
-    if (typeof clientTokenStr !== 'string' || !/^[0-9a-f]{32}$/.test(clientTokenStr)) {
-        return res.status(403).send('Jeton invalide.');
-    }
-
-    const tokenA = Buffer.from(item.deleteToken, 'hex');
-    const tokenB = Buffer.from(clientTokenStr, 'hex');
-
-    if (tokenA.length === tokenB.length && crypto.timingSafeEqual(tokenA, tokenB)) {
-        deleteItemData(req.params.id);
-        res.sendStatus(200);
-    } else {
-        res.status(403).send('Non autorisé ou expiré.');
-    }
-});
-
-app.get('/view/:id', (req, res) => {
-    const item = storedItems.get(req.params.id);
-    if (!item) return res.status(404).end();
-
-    res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'");
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.sendFile(item.path, (err) => {
-        if (err && !res.headersSent) res.status(500).end();
-    });
-});
-
-app.get('/download/:id', (req, res) => {
-    const item = storedItems.get(req.params.id);
-    if (!item) return res.status(404).send('Expiré.');
-
-    pauseTimer(item.id);
-    res.download(item.path, item.originalName, (err) => {
-        resumeTimer(item.id);
-        if (err && !res.headersSent) res.status(500).end();
-    });
-});
-
 app.use((err, req, res, next) => {
-    if (req.multerTempFiles) {
-        req.multerTempFiles.forEach(f => safeUnlink(f));
-        req.multerTempFiles = [];
-    }
-
-    if (err instanceof multer.MulterError) {
-        if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).send("Un fichier dépasse la limite autorisée (14 Go max).");
-        if (err.code === 'LIMIT_FIELD_SIZE') return res.status(413).send("Le texte est trop long (2 Mo max).");
-        return res.status(400).send(`Erreur d'upload : ${err.message}`);
-    } else if (err) {
-        return res.status(500).send("Erreur serveur : Le transfert a été interrompu.");
-    }
+    if (err) return res.status(500).send("Erreur serveur inattendue.");
     next();
 });
 
